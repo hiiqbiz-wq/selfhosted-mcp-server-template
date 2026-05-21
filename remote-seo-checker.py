@@ -97,10 +97,10 @@ def pacom_tables() -> dict:
     """
     sql = """
     SELECT
-      schemaname || '.' || tablename AS table_name,
+      schemaname || '.' || relname AS table_name,
       n_live_tup AS row_count
     FROM pg_stat_user_tables
-    ORDER BY schemaname, tablename
+    ORDER BY schemaname, relname
     """
     with get_pg_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -121,14 +121,17 @@ def pacom_recent_cli(n: int = 20) -> dict:
     n = max(1, min(100, int(n)))
     sql = """
     SELECT
-      created_at,
-      cli_name,
-      subcommand,
+      ts,
+      rig_hostname,
+      tool_name,
       args,
-      exit_code,
+      backend,
+      endpoint,
+      status,
+      error_message,
       duration_ms
     FROM cli_audit
-    ORDER BY created_at DESC
+    ORDER BY ts DESC
     LIMIT %s
     """
     with get_pg_conn() as conn:
@@ -136,7 +139,7 @@ def pacom_recent_cli(n: int = 20) -> dict:
             cur.execute(sql, (n,))
             return {
                 "entries": [dict(r) for r in cur.fetchall()],
-                "node": "Pacific (hiiq-rtx-5070) via PACOM cli_audit",
+                "source": "PACOM cli_audit table (Pacific PG18 :5430)",
             }
 
 
