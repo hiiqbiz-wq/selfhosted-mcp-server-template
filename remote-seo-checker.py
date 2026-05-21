@@ -4,10 +4,12 @@ HIIQ Edge MCP gateway — remote MCP server exposing HIIQ tools to any Claude su
 Runs on the Hostinger VPS (mcp.hiiqbiz.com). Tools that need data reach back to
 Pacific (PACOM Postgres at 100.87.218.106:5430) via the host's Tailscale interface.
 
+Bearer-token authenticated via FastMCP's StaticTokenVerifier. The token is sourced
+from MCP_GATEWAY_TOKEN env var; if unset, the gateway runs in open dev mode
+(with a startup warning).
+
 This file replaces the upstream `remote-seo-checker.py` (filename kept so the
 upstream Dockerfile CMD doesn't need to change).
-
-PHASE 4.1.1 — read-only PACOM access. No bearer auth yet (flagged for next iteration).
 """
 
 import os
@@ -15,14 +17,35 @@ import datetime
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from fastmcp import FastMCP
-
-mcp = FastMCP("HIIQ Edge")
+from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 
 PACOM_PG_HOST = os.environ.get("PACOM_PG_HOST", "100.87.218.106")
 PACOM_PG_PORT = int(os.environ.get("PACOM_PG_PORT", "5430"))
 PACOM_PG_DBNAME = os.environ.get("PACOM_PG_DBNAME", "pacom")
 PACOM_PG_USER = os.environ.get("PACOM_PG_USER", "postgres")
 PACOM_PG_PASSWORD = os.environ.get("PACOM_PG_PASSWORD", "")
+
+MCP_GATEWAY_TOKEN = os.environ.get("MCP_GATEWAY_TOKEN", "").strip()
+
+if MCP_GATEWAY_TOKEN:
+    verifier = StaticTokenVerifier(
+        tokens={
+            MCP_GATEWAY_TOKEN: {
+                "client_id": "hiiq-edge-client",
+                "scopes": ["read:hiiq"],
+            }
+        },
+        required_scopes=["read:hiiq"],
+    )
+    mcp = FastMCP(name="HIIQ Edge", auth=verifier)
+    print("[boot] Bearer-token auth enabled.", flush=True)
+else:
+    mcp = FastMCP(name="HIIQ Edge")
+    print(
+        "[boot] WARNING: MCP_GATEWAY_TOKEN not set — gateway is OPEN. "
+        "Set env var to enable auth.",
+        flush=True,
+    )
 
 
 def get_pg_conn(readonly: bool = True):
@@ -53,6 +76,7 @@ def ping_hiiq() -> dict:
         "node": "hiiqbiz-vps (Hostinger KVM 4, US-Boston)",
         "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
         "pacom_reachable": False,
+        "auth_enabled": bool(MCP_GATEWAY_TOKEN),
     }
     try:
         with get_pg_conn() as conn:
