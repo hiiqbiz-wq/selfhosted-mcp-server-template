@@ -11,6 +11,16 @@ allowlist (`ALLOWED_GH_USERS`, comma-separated).
 
 This file replaces the upstream `remote-seo-checker.py` (filename kept so the
 upstream Dockerfile CMD doesn't need to change).
+
+Tools (8):
+  ping_hiiq           — health + PACOM reachability + authenticated user
+  pacom_tables        — list user tables with row counts
+  pacom_recent_cli    — last N cli_audit entries
+  query_pacom         — arbitrary read-only SELECT
+  search_vault        — full-text search the indexed Obsidian vault (2780+ docs)
+  pacom_skills        — list registered skills, optional substring filter
+  pacom_plugins       — list installed plugins with capabilities
+  session_resume      — most recent Claude session handoffs (unconsumed by default)
 """
 
 import os
@@ -93,6 +103,10 @@ def get_pg_conn(readonly: bool = True):
     return conn
 
 
+# ---------------------------------------------------------------------------
+# Health + meta
+# ---------------------------------------------------------------------------
+
 @mcp.tool()
 def ping_hiiq() -> dict:
     """
@@ -109,6 +123,10 @@ def ping_hiiq() -> dict:
         "authenticated_as": user,
         "pacom_reachable": False,
         "auth_enabled": bool(GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET),
+        "tools": [
+            "ping_hiiq", "pacom_tables", "pacom_recent_cli", "query_pacom",
+            "search_vault", "pacom_skills", "pacom_plugins", "session_resume",
+        ],
     }
     try:
         with get_pg_conn() as conn:
@@ -121,12 +139,16 @@ def ping_hiiq() -> dict:
     return out
 
 
+# ---------------------------------------------------------------------------
+# PACOM raw SQL access (read-only)
+# ---------------------------------------------------------------------------
+
 @mcp.tool()
 def pacom_tables() -> dict:
     """
-    List all user tables in PACOM with their live row counts. Note that
-    row counts come from pg_stat_user_tables and may lag real counts until
-    autovacuum runs; for an exact count use query_pacom with COUNT(*).
+    List all user tables in PACOM with their live row counts. Note: counts come
+    from pg_stat_user_tables and may lag real counts until autovacuum runs;
+    for an exact count, use `query_pacom` with COUNT(*).
     """
     require_authorized()
     sql = """
@@ -146,7 +168,7 @@ def pacom_tables() -> dict:
 def pacom_recent_cli(n: int = 20) -> dict:
     """
     Return the N most recent entries from PACOM's cli_audit table. Shows
-    what tools ran on Pacific recently, with their args, status, and timing.
+    what tools ran on Pacific recently, with args, status, and timing.
 
     Args:
         n: Number of entries to return. Clamped to 1..100. Default 20.
@@ -154,16 +176,8 @@ def pacom_recent_cli(n: int = 20) -> dict:
     require_authorized()
     n = max(1, min(100, int(n)))
     sql = """
-    SELECT
-      ts,
-      rig_hostname,
-      tool_name,
-      args,
-      backend,
-      endpoint,
-      status,
-      error_message,
-      duration_ms
+    SELECT ts, rig_hostname, tool_name, args, backend, endpoint,
+           status, error_message, duration_ms
     FROM cli_audit
     ORDER BY ts DESC
     LIMIT %s
@@ -189,8 +203,8 @@ def query_pacom(sql: str, max_rows: int = 50) -> dict:
         max_rows: Cap on returned rows (1..500, default 50).
 
     Returns:
-        dict with `columns` (list of column names), `rows` (list of dicts),
-        and `row_count`. On error, returns `{"error": "<message>"}`.
+        dict with `columns`, `rows`, and `row_count`. On error, returns
+        `{"error": "<message>"}`.
     """
     require_authorized()
     max_rows = max(1, min(500, int(max_rows)))
@@ -207,6 +221,158 @@ def query_pacom(sql: str, max_rows: int = 50) -> dict:
                 }
     except Exception as e:
         return {"error": str(e)[:500]}
+
+
+# ---------------------------------------------------------------------------
+# Vault search (PACOM vault_index, ~2780 docs, ts_rank full-text)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def search_vault(query: str, limit: int = 10, scope: str = None) -> dict:
+    """
+    Full-text search the indexed HIIQ vault (~2780 files across `.claude/memory/`,
+    `notes/`, `playbooks/`, `knowledge/`, etc.). Uses PostgreSQL ts_rank for
+    relevance ordering and ts_headline for snippet generation.
+
+    Args:
+        query: Search terms (English). Can be multi-word.
+        limit: Max results (1..50, default 10).
+        scope: Optional scope filter. Valid scopes include 'notes', 'memory',
+               'knowledge', 'claude', 'plans', 'reports', 'playbooks',
+               'rules', 'projects'. None = search all scopes.
+
+    Returns:
+        dict with `hits` (each: path, scope, mtime, rank, snippet) and the
+        echoed query/scope.
+    """
+    require_authorized()
+    limit = max(1, min(50, int(limit)))
+    if scope:
+        sql = """
+        SELECT path, scope, mtime,
+               ts_rank(content_tsv, plainto_tsquery('english', %(q)s)) AS rank,
+               ts_headline('english', content_text,
+                           plainto_tsquery('english', %(q)s),
+                           'MaxFragments=2,MaxWords=40,MinWords=10') AS snippet
+        FROM vault_index
+        WHERE content_tsv @@ plainto_tsquery('english', %(q)s)
+          AND scope = %(scope)s
+        ORDER BY rank DESC
+        LIMIT %(limit)s
+        """
+        params = {"q": query, "scope": scope, "limit": limit}
+    else:
+        sql = """
+        SELECT path, scope, mtime,
+               ts_rank(content_tsv, plainto_tsquery('english', %(q)s)) AS rank,
+               ts_headline('english', content_text,
+                           plainto_tsquery('english', %(q)s),
+                           'MaxFragments=2,MaxWords=40,MinWords=10') AS snippet
+        FROM vault_index
+        WHERE content_tsv @@ plainto_tsquery('english', %(q)s)
+        ORDER BY rank DESC
+        LIMIT %(limit)s
+        """
+        params = {"q": query, "limit": limit}
+    with get_pg_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, params)
+            return {
+                "hits": [dict(r) for r in cur.fetchall()],
+                "query": query,
+                "scope_filter": scope,
+            }
+
+
+# ---------------------------------------------------------------------------
+# Skills + plugins registries (snapshot of Pacific's Claude config layer)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def pacom_skills(query: str = None) -> dict:
+    """
+    List Claude skills registered in PACOM (~27 skills as of 2026-05-21).
+    Each skill includes path, scope, plugin association, description, and
+    when-to-use hint.
+
+    Args:
+        query: Optional case-insensitive substring filter on name/description/
+               when-to-use text. None = return all skills.
+    """
+    require_authorized()
+    if query:
+        sql = """
+        SELECT name, path, scope, plugin_name, description, when_to_use, model
+        FROM skills_registry
+        WHERE search_text ILIKE %s
+        ORDER BY name
+        """
+        params = (f"%{query}%",)
+    else:
+        sql = """
+        SELECT name, path, scope, plugin_name, description, when_to_use, model
+        FROM skills_registry
+        ORDER BY name
+        """
+        params = ()
+    with get_pg_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, params)
+            return {"skills": [dict(r) for r in cur.fetchall()]}
+
+
+@mcp.tool()
+def pacom_plugins() -> dict:
+    """
+    List Claude plugins registered in PACOM with their declared capabilities
+    and per-component counts (skills/agents/commands/hooks/mcp servers).
+    """
+    require_authorized()
+    sql = """
+    SELECT name, version, description, author_name, install_path,
+           capabilities, skill_count, agent_count, command_count,
+           hook_count, mcp_count
+    FROM plugins_registry
+    ORDER BY name
+    """
+    with get_pg_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql)
+            return {"plugins": [dict(r) for r in cur.fetchall()]}
+
+
+# ---------------------------------------------------------------------------
+# Session handoff (resume a previous Claude session)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def session_resume(only_unconsumed: bool = True, limit: int = 5) -> dict:
+    """
+    Get recent Claude session handoffs saved to PACOM via `save-pacom`.
+    Use this to pick up where a previous session (on any rig) left off —
+    last command, current chapter, next planned action, plus the raw
+    handoff narrative.
+
+    Args:
+        only_unconsumed: If True (default), only show handoffs not yet
+                         marked as consumed.
+        limit: Max handoffs to return (1..20, default 5).
+    """
+    require_authorized()
+    limit = max(1, min(20, int(limit)))
+    where = "WHERE consumed_at IS NULL" if only_unconsumed else ""
+    sql = f"""
+    SELECT session_id, rig_hostname, ended_at, last_command,
+           current_chapter, next_action, raw_handoff, consumed_at
+    FROM session_handoff
+    {where}
+    ORDER BY ended_at DESC NULLS LAST
+    LIMIT %s
+    """
+    with get_pg_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (limit,))
+            return {"handoffs": [dict(r) for r in cur.fetchall()]}
 
 
 if __name__ == "__main__":
