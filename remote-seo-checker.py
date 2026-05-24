@@ -31,7 +31,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor, Json
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.github import GitHubProvider
-from fastmcp.server.dependencies import get_access_token
+from fastmcp.server.dependencies import get_access_token, get_http_request
 
 # --- PACOM connection ---
 PACOM_PG_HOST = os.environ.get("PACOM_PG_HOST", "100.87.218.106")
@@ -101,6 +101,46 @@ def require_andre() -> str:
     return user
 
 
+def detect_caller_surface() -> tuple[str, str]:
+    """Classify the calling Claude surface from the HTTP User-Agent.
+
+    Used to stamp `author` on memory writes so cross-session/cross-rig coordination
+    can disambiguate which Claude proposed which memory. Previously the gateway
+    stamped `author='andre'` for all writes because the discriminator was GitHub
+    login (always the allowlisted hiiqbiz-wq); that masked which Claude surface
+    wrote what.
+
+    Returns:
+        (surface_tag, raw_user_agent). surface_tag is one of:
+          'claude-code', 'claude-desktop', 'claudeai-web', 'claude-mobile',
+          'claude' (unknown Claude variant), 'claude-unknown' (no Claude hint
+          in UA at all), or 'no-http-ctx' (FastMCP didn't surface HTTP context;
+          should not happen on this HTTP-only deployment).
+
+    Limitation: cannot differentiate Pacific Claude Code from Central Claude
+    Code via passive User-Agent inspection — both send the same UA. Per-rig
+    discrimination needs a client-side header or per-rig OAuth identity (see
+    Phase 4.7.2+ permanent fix).
+    """
+    try:
+        req = get_http_request()
+    except RuntimeError:
+        return ("no-http-ctx", "")
+    ua = (req.headers.get("user-agent") or "")
+    ua_lower = ua.lower()
+    if "claude-code" in ua_lower or "claude_code" in ua_lower or "claudecode" in ua_lower:
+        return ("claude-code", ua)
+    if "claude-desktop" in ua_lower or "claude_desktop" in ua_lower or "claudedesktop" in ua_lower:
+        return ("claude-desktop", ua)
+    if "anthropicapp" in ua_lower or "claude-mobile" in ua_lower or "claudemobile" in ua_lower:
+        return ("claude-mobile", ua)
+    if "claude.ai" in ua_lower or "claudeai" in ua_lower:
+        return ("claudeai-web", ua)
+    if "claude" in ua_lower:
+        return ("claude", ua)
+    return ("claude-unknown", ua)
+
+
 def get_pg_conn(readonly: bool = True):
     """Open a Postgres connection to PACOM. Defaults to read-only session."""
     conn = psycopg2.connect(
@@ -125,13 +165,15 @@ def ping_hiiq() -> dict:
     """Health check for the HIIQ Edge MCP gateway. Returns server identity,
     UTC timestamp, authenticated GitHub user, PACOM reachability, and tool list."""
     user = require_authorized()
+    surface, _ua = detect_caller_surface()
     out = {
         "status": "ok",
         "server": "HIIQ Edge MCP gateway",
-        "version": "v5 (memory tools)",
+        "version": "v5.1 (surface-aware attribution)",
         "node": "hiiqbiz-vps (Hostinger KVM 4, US-Boston)",
         "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
         "authenticated_as": user,
+        "calling_surface": surface,
         "pacom_reachable": False,
         "auth_enabled": bool(GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET),
     }
@@ -336,16 +378,24 @@ def add_memory(
     related_ids = list(related_ids or [])
     metadata = dict(metadata or {})
 
+    # Author = which Claude surface proposed this memory. All add_memory calls
+    # through this HTTP gateway are by definition Claude doing the writing —
+    # Andre interacts via Claude surfaces, not via raw curl. Andre's authority
+    # is expressed via verify_memory (pending->approved) + archive_memory, not
+    # via the writer field.
+    surface, raw_ua = detect_caller_surface()
+    author = surface
+    if raw_ua:
+        metadata.setdefault("client_user_agent", raw_ua[:200])
+    metadata.setdefault("authenticated_gh_login", user)
+
     # Governance check: high-confidence Claude writes must cite Decision Matrix
-    is_andre = (user == ANDRE_GH_LOGIN)
-    if not is_andre and confidence >= 7 and not decision_matrix_anchors:
+    if confidence >= 7 and not decision_matrix_anchors:
         return {
             "error": "confidence >= 7 requires citing Decision Matrix anchors. "
             "Either lower confidence (Claude's default for unsupported claims) "
             "or cite at least one Decision-Matrix.md 'shape:' string."
         }
-
-    author = f"claude-via-{user}" if not is_andre else "andre"
     sql = """
     INSERT INTO memories (
         content, summary, memory_type, scope, author,
