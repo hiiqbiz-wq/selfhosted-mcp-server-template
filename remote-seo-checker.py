@@ -25,6 +25,7 @@ Tools (14 total):
 """
 
 import os
+import re
 import datetime
 import json
 import psycopg2
@@ -50,6 +51,19 @@ ALLOWED_GH_USERS = {
     if u.strip()
 }
 ANDRE_GH_LOGIN = os.environ.get("ANDRE_GH_LOGIN", "hiiqbiz-wq").strip()
+
+# --- Per-rig attribution (Phase 4.7.2 / v5.2) ---
+# Clients (Pacific Claude Code, Central Claude Code, etc.) send this header to
+# stamp memory writes with the originating rig. Validated against RIG_REGEX +
+# optional HIIQ_RIG_ALLOWLIST. Empty / missing / invalid → rig is None and
+# attribution falls back to surface-only (e.g. 'claude-code').
+RIG_HEADER_NAME = "x-hiiq-rig"  # HTTP headers are case-insensitive; Starlette lowercases
+RIG_REGEX = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+HIIQ_RIG_ALLOWLIST = {
+    r.strip().lower()
+    for r in os.environ.get("HIIQ_RIG_ALLOWLIST", "").split(",")
+    if r.strip()
+}  # empty set = no allowlist enforcement; any regex-valid rig passes
 
 
 if GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET:
@@ -101,44 +115,73 @@ def require_andre() -> str:
     return user
 
 
-def detect_caller_surface() -> tuple[str, str]:
-    """Classify the calling Claude surface from the HTTP User-Agent.
+def _classify_surface_from_ua(ua: str) -> str:
+    """Return the surface tag matching this User-Agent string."""
+    ua_lower = ua.lower()
+    if "claude-code" in ua_lower or "claude_code" in ua_lower or "claudecode" in ua_lower:
+        return "claude-code"
+    if "claude-desktop" in ua_lower or "claude_desktop" in ua_lower or "claudedesktop" in ua_lower:
+        return "claude-desktop"
+    if "anthropicapp" in ua_lower or "claude-mobile" in ua_lower or "claudemobile" in ua_lower:
+        return "claude-mobile"
+    if "claude.ai" in ua_lower or "claudeai" in ua_lower:
+        return "claudeai-web"
+    if "claude" in ua_lower:
+        return "claude"
+    return "claude-unknown"
 
-    Used to stamp `author` on memory writes so cross-session/cross-rig coordination
-    can disambiguate which Claude proposed which memory. Previously the gateway
-    stamped `author='andre'` for all writes because the discriminator was GitHub
-    login (always the allowlisted hiiqbiz-wq); that masked which Claude surface
-    wrote what.
+
+def _validate_rig(raw: str) -> str | None:
+    """Return a normalized rig name if `raw` is well-formed + allowlisted, else None.
+
+    Validation:
+      - lowercased + stripped
+      - matches RIG_REGEX (`^[a-z0-9][a-z0-9-]{0,31}$`)
+      - if HIIQ_RIG_ALLOWLIST is non-empty, must be in it
+
+    Prevents author-field injection from a malicious header value.
+    """
+    if not raw:
+        return None
+    rig = raw.strip().lower()
+    if not RIG_REGEX.match(rig):
+        return None
+    if HIIQ_RIG_ALLOWLIST and rig not in HIIQ_RIG_ALLOWLIST:
+        return None
+    return rig
+
+
+def detect_caller_surface() -> tuple[str, str, str | None]:
+    """Classify the calling Claude surface + originating rig from HTTP headers.
+
+    Stamps `author` on memory writes so cross-session/cross-rig coordination
+    can disambiguate which Claude proposed which memory. The surface tag comes
+    from User-Agent (claude-code / claude-desktop / claudeai-web / claude-mobile
+    / claude / claude-unknown). The rig tag comes from the X-HIIQ-Rig header
+    that each rig's Claude Code config injects — this is what tells Pacific
+    Claude Code apart from Central Claude Code (their User-Agents are identical).
 
     Returns:
-        (surface_tag, raw_user_agent). surface_tag is one of:
-          'claude-code', 'claude-desktop', 'claudeai-web', 'claude-mobile',
-          'claude' (unknown Claude variant), 'claude-unknown' (no Claude hint
-          in UA at all), or 'no-http-ctx' (FastMCP didn't surface HTTP context;
-          should not happen on this HTTP-only deployment).
+        (surface_tag, raw_user_agent, rig_name_or_none).
+        - surface_tag: one of 'claude-code', 'claude-desktop', 'claudeai-web',
+          'claude-mobile', 'claude', 'claude-unknown', 'no-http-ctx'.
+        - raw_user_agent: the full UA string (for metadata stashing).
+        - rig_name_or_none: the validated X-HIIQ-Rig value (e.g. 'pacific',
+          'central', 'edge') if present + well-formed + allowlisted, else None.
 
-    Limitation: cannot differentiate Pacific Claude Code from Central Claude
-    Code via passive User-Agent inspection — both send the same UA. Per-rig
-    discrimination needs a client-side header or per-rig OAuth identity (see
-    Phase 4.7.2+ permanent fix).
+    Composing `author`:
+        f"{surface_tag}-{rig}" if rig else surface_tag
+        e.g. 'claude-code-pacific', 'claude-code-central', or 'claude-code'
+        for a session that didn't set the header (e.g. claude.ai web connector).
     """
     try:
         req = get_http_request()
     except RuntimeError:
-        return ("no-http-ctx", "")
+        return ("no-http-ctx", "", None)
     ua = (req.headers.get("user-agent") or "")
-    ua_lower = ua.lower()
-    if "claude-code" in ua_lower or "claude_code" in ua_lower or "claudecode" in ua_lower:
-        return ("claude-code", ua)
-    if "claude-desktop" in ua_lower or "claude_desktop" in ua_lower or "claudedesktop" in ua_lower:
-        return ("claude-desktop", ua)
-    if "anthropicapp" in ua_lower or "claude-mobile" in ua_lower or "claudemobile" in ua_lower:
-        return ("claude-mobile", ua)
-    if "claude.ai" in ua_lower or "claudeai" in ua_lower:
-        return ("claudeai-web", ua)
-    if "claude" in ua_lower:
-        return ("claude", ua)
-    return ("claude-unknown", ua)
+    surface = _classify_surface_from_ua(ua)
+    rig = _validate_rig(req.headers.get(RIG_HEADER_NAME) or "")
+    return (surface, ua, rig)
 
 
 def get_pg_conn(readonly: bool = True):
@@ -165,15 +208,16 @@ def ping_hiiq() -> dict:
     """Health check for the HIIQ Edge MCP gateway. Returns server identity,
     UTC timestamp, authenticated GitHub user, PACOM reachability, and tool list."""
     user = require_authorized()
-    surface, _ua = detect_caller_surface()
+    surface, _ua, rig = detect_caller_surface()
     out = {
         "status": "ok",
         "server": "HIIQ Edge MCP gateway",
-        "version": "v5.1 (surface-aware attribution)",
+        "version": "v5.2 (rig-aware attribution)",
         "node": "hiiqbiz-vps (Hostinger KVM 4, US-Boston)",
         "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
         "authenticated_as": user,
         "calling_surface": surface,
+        "calling_rig": rig,  # None unless X-HIIQ-Rig header set + validated
         "pacom_reachable": False,
         "auth_enabled": bool(GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET),
     }
@@ -378,16 +422,19 @@ def add_memory(
     related_ids = list(related_ids or [])
     metadata = dict(metadata or {})
 
-    # Author = which Claude surface proposed this memory. All add_memory calls
-    # through this HTTP gateway are by definition Claude doing the writing —
-    # Andre interacts via Claude surfaces, not via raw curl. Andre's authority
-    # is expressed via verify_memory (pending->approved) + archive_memory, not
-    # via the writer field.
-    surface, raw_ua = detect_caller_surface()
-    author = surface
+    # Author = which Claude surface (+ which rig, if known) proposed this
+    # memory. All add_memory calls through this HTTP gateway are by definition
+    # Claude doing the writing — Andre interacts via Claude surfaces, not via
+    # raw curl. Andre's authority is expressed via verify_memory + archive_memory,
+    # not via the writer field. Rig identity comes from the X-HIIQ-Rig header
+    # each rig's Claude Code config injects; surface comes from User-Agent.
+    surface, raw_ua, rig = detect_caller_surface()
+    author = f"{surface}-{rig}" if rig else surface
     if raw_ua:
         metadata.setdefault("client_user_agent", raw_ua[:200])
     metadata.setdefault("authenticated_gh_login", user)
+    if rig:
+        metadata.setdefault("rig", rig)
 
     # Governance check: high-confidence Claude writes must cite Decision Matrix
     if confidence >= 7 and not decision_matrix_anchors:
