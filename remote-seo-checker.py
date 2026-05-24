@@ -31,7 +31,9 @@ import json
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
 from fastmcp import FastMCP
+from fastmcp.server.auth import MultiAuth
 from fastmcp.server.auth.providers.github import GitHubProvider
+from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from fastmcp.server.dependencies import get_access_token, get_http_request
 
 # --- PACOM connection ---
@@ -52,6 +54,21 @@ ALLOWED_GH_USERS = {
 }
 ANDRE_GH_LOGIN = os.environ.get("ANDRE_GH_LOGIN", "hiiqbiz-wq").strip()
 
+# --- Static bearer auth fallback (Phase 4.7.3 / v5.3) ---
+# Enables non-OAuth clients (e.g. per-rig `.mcp.json` entries on Claude Code)
+# to authenticate via a shared bearer token. Coexists with OAuth via MultiAuth;
+# OAuth path stays for the claude.ai-managed connector. Static bearer requests
+# get a synthetic AccessToken with claims.login=ANDRE_GH_LOGIN, so the existing
+# require_authorized / require_andre helpers keep working unchanged.
+#
+# Generate a fresh token with:
+#     python -c "import secrets; print(secrets.token_urlsafe(32))"
+#
+# Anyone with this bearer has Andre-level authority on the gateway (can verify
+# / archive memories). Treat it like a root credential. Rotate by changing the
+# env var + redeploying.
+HIIQ_GATEWAY_STATIC_BEARER = os.environ.get("HIIQ_GATEWAY_STATIC_BEARER", "").strip()
+
 # --- Per-rig attribution (Phase 4.7.2 / v5.2) ---
 # Clients (Pacific Claude Code, Central Claude Code, etc.) send this header to
 # stamp memory writes with the originating rig. Validated against RIG_REGEX +
@@ -67,7 +84,7 @@ HIIQ_RIG_ALLOWLIST = {
 
 
 if GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET:
-    auth = GitHubProvider(
+    oauth_provider = GitHubProvider(
         client_id=GITHUB_CLIENT_ID,
         client_secret=GITHUB_CLIENT_SECRET,
         base_url=PUBLIC_BASE_URL,
@@ -79,11 +96,37 @@ if GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET:
             "http://localhost:*",
         ],
     )
-    mcp = FastMCP(name="HIIQ Edge", auth=auth)
-    print(
-        f"[boot] GitHub OAuth enabled. Allowlist: {sorted(ALLOWED_GH_USERS)}",
-        flush=True,
-    )
+
+    if HIIQ_GATEWAY_STATIC_BEARER:
+        # Compose OAuth (for claude.ai connectors) + StaticTokenVerifier (for
+        # per-rig local `.mcp.json` entries). MultiAuth tries OAuth first, then
+        # each verifier in order. The synthetic claims block makes the static
+        # bearer indistinguishable to the require_authorized / require_andre
+        # checks downstream — both paths produce a `login=hiiqbiz-wq` token.
+        static_verifier = StaticTokenVerifier(
+            tokens={
+                HIIQ_GATEWAY_STATIC_BEARER: {
+                    "client_id": "hiiq-static-bearer",
+                    "scopes": ["read:user"],
+                    "login": ANDRE_GH_LOGIN,
+                    "auth_method": "static-bearer",
+                }
+            }
+        )
+        auth = MultiAuth(server=oauth_provider, verifiers=[static_verifier])
+        mcp = FastMCP(name="HIIQ Edge", auth=auth)
+        print(
+            f"[boot] GitHub OAuth + static bearer enabled. "
+            f"Allowlist: {sorted(ALLOWED_GH_USERS)}",
+            flush=True,
+        )
+    else:
+        mcp = FastMCP(name="HIIQ Edge", auth=oauth_provider)
+        print(
+            f"[boot] GitHub OAuth enabled (no static bearer set). "
+            f"Allowlist: {sorted(ALLOWED_GH_USERS)}",
+            flush=True,
+        )
 else:
     mcp = FastMCP(name="HIIQ Edge")
     print(
@@ -209,13 +252,19 @@ def ping_hiiq() -> dict:
     UTC timestamp, authenticated GitHub user, PACOM reachability, and tool list."""
     user = require_authorized()
     surface, _ua, rig = detect_caller_surface()
+    # Diagnostic: which auth path verified this request — OAuth via GitHubProvider
+    # or static bearer via StaticTokenVerifier. Reads the synthetic claim we set
+    # at static-bearer config time; OAuth tokens won't have it.
+    token = get_access_token()
+    auth_method = (token.claims.get("auth_method") if token else None) or "oauth"
     out = {
         "status": "ok",
         "server": "HIIQ Edge MCP gateway",
-        "version": "v5.2 (rig-aware attribution)",
+        "version": "v5.3 (rig-aware + static-bearer)",
         "node": "hiiqbiz-vps (Hostinger KVM 4, US-Boston)",
         "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
         "authenticated_as": user,
+        "auth_method": auth_method,  # 'oauth' or 'static-bearer'
         "calling_surface": surface,
         "calling_rig": rig,  # None unless X-HIIQ-Rig header set + validated
         "pacom_reachable": False,
