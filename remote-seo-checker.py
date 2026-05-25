@@ -1,33 +1,36 @@
 """
-HIIQ Edge MCP gateway v5 — adds bilateral memory tools.
+HIIQ Edge MCP gateway v5.3 — adds Docling document-conversion proxy tools.
 
 Runs on the Hostinger VPS (mcp.hiiqbiz.com). Reaches Pacific PACOM at
-100.87.218.106:5430 via the host's Tailscale interface.
+100.87.218.106:5430 via the host's Tailscale interface. Reaches the sibling
+docling-serve container via the internal Coolify docker network.
 
 Auth: GitHub OAuth via FastMCP's GitHubProvider (DCR-compliant, Claude.ai-friendly).
 Per-tool gate: require_authorized() checks login against ALLOWED_GH_USERS.
 
-Tools (14 total):
+Tools (16 total):
   Existing (Phase 4.1.x):
     ping_hiiq, pacom_tables, pacom_recent_cli, query_pacom,
     search_vault, pacom_skills, pacom_plugins, session_resume
 
-  New (Phase 4.7 — bilateral memory):
-    add_memory       — Claude/Andre write (Claude→pending, Andre→pending too;
-                       verify with verify_memory after)
-    recall_memory    — full-text search the memories table (semantic later)
-    list_memories    — browse without query, filter by type/scope/author/since
-    verify_memory    — Andre-only: promote pending → approved
-    archive_memory   — Andre-only: soft-delete (sets archived_at)
-    recall_sensitive_memory — passphrase-gated read of 'secret'-tier memories
-                              (stub in v5; pgcrypto path lands when Andre's
-                              passphrase env var is wired)
+  Phase 4.7 — bilateral memory:
+    add_memory, recall_memory, list_memories,
+    verify_memory (Andre-only), archive_memory (Andre-only),
+    recall_sensitive_memory (stub pending 4.7.1)
+
+  New (v5.3 — Docling proxy):
+    docling_health      — probe sibling docling-serve container
+    convert_document    — synchronous PDF/DOCX/PPTX/XLSX/HTML/image → Markdown
+                          via internal docling-serve. B3 architecture: docling-serve
+                          has zero auth and is reachable only on the private docker
+                          network; this gateway is the public OAuth-gated surface.
 """
 
 import os
 import re
 import datetime
 import json
+import httpx
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
 from fastmcp import FastMCP
@@ -40,6 +43,13 @@ PACOM_PG_PORT = int(os.environ.get("PACOM_PG_PORT", "5430"))
 PACOM_PG_DBNAME = os.environ.get("PACOM_PG_DBNAME", "pacom")
 PACOM_PG_USER = os.environ.get("PACOM_PG_USER", "postgres")
 PACOM_PG_PASSWORD = os.environ.get("PACOM_PG_PASSWORD", "")
+
+# --- Docling sibling container (B3 architecture, v5.3) ---
+# docling-serve runs as a private Coolify container on the same docker network.
+# It has zero auth — reachable only inside the network. This gateway is the
+# public OAuth-gated surface; convert_document() proxies to it via httpx.
+DOCLING_SERVICE_URL = os.environ.get("DOCLING_SERVICE_URL", "http://docling-serve:5001").rstrip("/")
+DOCLING_HTTP_TIMEOUT = float(os.environ.get("DOCLING_HTTP_TIMEOUT", "180"))
 
 # --- OAuth ---
 GITHUB_CLIENT_ID = os.environ.get("GITHUB_OAUTH_CLIENT_ID", "").strip()
@@ -212,7 +222,7 @@ def ping_hiiq() -> dict:
     out = {
         "status": "ok",
         "server": "HIIQ Edge MCP gateway",
-        "version": "v5.2 (rig-aware attribution)",
+        "version": "v5.3 (docling proxy)",
         "node": "hiiqbiz-vps (Hostinger KVM 4, US-Boston)",
         "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
         "authenticated_as": user,
@@ -700,6 +710,136 @@ def recall_sensitive_memory(query: str, passphrase: str) -> dict:
             "stores plaintext but is segregated from default queries."
         ),
     }
+
+
+# ============================================================================
+# v5.3 — Docling document-conversion proxy tools
+# ============================================================================
+# B3 architecture: docling-serve runs as a sibling container with no public
+# ingress; it has zero authentication. This gateway is the public OAuth-gated
+# surface that proxies to it over the private docker network.
+#
+# Sync conversion only for now — small/medium docs (under ~10 pages PDF on CPU).
+# Larger docs need /v1/convert/source/async + polling; add when needed.
+
+
+@mcp.tool()
+def docling_health() -> dict:
+    """Health probe for the internal docling-serve sibling container.
+
+    Confirms the conversion backend is reachable on the private docker
+    network. No PDF round-trip — just a /health ping. Use this first if
+    convert_document() is failing to localize the problem.
+
+    Returns:
+        dict with `ok`, `status_code`, `docling_service_url`, `body_excerpt`.
+        On failure: `ok=False` plus `error` and a `hint` about likely cause.
+    """
+    require_authorized()
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            r = client.get(f"{DOCLING_SERVICE_URL}/health")
+        return {
+            "ok": r.status_code == 200,
+            "status_code": r.status_code,
+            "docling_service_url": DOCLING_SERVICE_URL,
+            "body_excerpt": r.text[:200],
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e)[:300],
+            "docling_service_url": DOCLING_SERVICE_URL,
+            "hint": (
+                "docling-serve container may not be running, or DOCLING_SERVICE_URL "
+                "env var on the gateway points at the wrong hostname/port. Expected "
+                "docker DNS hostname is 'docling-serve' inside the coolify network."
+            ),
+        }
+
+
+@mcp.tool()
+def convert_document(
+    source_url: str,
+    output_formats: list = None,
+    timeout_seconds: float = None,
+) -> dict:
+    """Convert a public-URL document (PDF/DOCX/PPTX/XLSX/HTML/image) to Markdown
+    via the internal docling-serve container. Synchronous.
+
+    Suitable for small/medium docs (under ~10 pages PDF on CPU). First call
+    after container restart takes 30-60s for model load. Larger docs may
+    exceed the MCP transport timeout — for those, use the async endpoint
+    (not yet exposed; add when needed).
+
+    Args:
+        source_url: Public URL of the document. docling-serve fetches it
+                    directly, so it must be internet-reachable from the VPS.
+                    Local files are not supported via this endpoint — base64
+                    upload is possible but not exposed here yet.
+        output_formats: List of output formats to populate. Default ['md', 'json'].
+                        Options: 'md' (markdown), 'json' (structured
+                        DoclingDocument), 'html', 'text', 'doctags'. More
+                        formats = larger response payload.
+        timeout_seconds: Per-call HTTP timeout override. Default 180s from env.
+
+    Returns:
+        On success: dict with `status` ('success'|'partial_success'|'failure'),
+        `processing_time`, `source_url`, `md_content`, and the other format
+        fields you requested. Unrequested format fields are None.
+        On failure: dict with `error` and optionally `hint` / `body_excerpt`.
+    """
+    require_authorized()
+    if not source_url or not source_url.strip():
+        return {"error": "source_url cannot be empty"}
+    output_formats = list(output_formats or ["md", "json"])
+    timeout = float(timeout_seconds) if timeout_seconds else DOCLING_HTTP_TIMEOUT
+    payload = {
+        "http_sources": [{"url": source_url.strip()}],
+        "options": {
+            "output_formats": output_formats,
+        },
+    }
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            r = client.post(
+                f"{DOCLING_SERVICE_URL}/v1/convert/source",
+                json=payload,
+            )
+        if r.status_code != 200:
+            return {
+                "error": f"docling-serve returned HTTP {r.status_code}",
+                "body_excerpt": r.text[:500],
+                "hint": (
+                    "422 usually means the request payload shape is wrong; "
+                    "5xx usually means docling-serve is unhealthy — try docling_health."
+                ),
+            }
+        data = r.json()
+        doc = (data.get("document") or {}) if isinstance(data, dict) else {}
+        return {
+            "status": data.get("status"),
+            "processing_time": data.get("processing_time"),
+            "source_url": source_url,
+            "output_formats": output_formats,
+            "md_content": doc.get("md_content"),
+            "json_content": doc.get("json_content") if "json" in output_formats else None,
+            "html_content": doc.get("html_content") if "html" in output_formats else None,
+            "text_content": doc.get("text_content") if "text" in output_formats else None,
+            "doctags_content": doc.get("doctags_content") if "doctags" in output_formats else None,
+            "errors": data.get("errors") or [],
+        }
+    except httpx.TimeoutException:
+        return {
+            "error": "conversion timed out",
+            "timeout_seconds": timeout,
+            "hint": (
+                "first call after container restart needs ~30-60s for model load; "
+                "large PDFs may need longer. Retry, or pass a larger timeout_seconds."
+            ),
+        }
+    except Exception as e:
+        return {"error": str(e)[:500]}
 
 
 if __name__ == "__main__":
