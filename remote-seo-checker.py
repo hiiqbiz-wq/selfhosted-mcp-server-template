@@ -43,6 +43,7 @@ import datetime
 import json
 import httpx
 import psycopg2
+from typing import Optional
 from psycopg2.extras import RealDictCursor, Json
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.github import GitHubProvider
@@ -74,6 +75,7 @@ TTS_SERVICE_TOKEN = (
     os.environ.get("TTS_SERVICE_TOKEN")
     or os.environ.get("CB_MCP_AUTH_TOKEN", "")
 ).strip()
+TTS_VOICE_LABEL_REGEX = re.compile(r"^[a-z0-9][a-z0-9_-]{0,30}$")
 
 # --- OAuth ---
 GITHUB_CLIENT_ID = os.environ.get("GITHUB_OAUTH_CLIENT_ID", "").strip()
@@ -890,6 +892,16 @@ def _tts_auth_headers() -> dict:
     return {"Authorization": f"Bearer {TTS_SERVICE_TOKEN}"}
 
 
+def _validate_tts_voice_label(label: str) -> Optional[str]:
+    if not label:
+        return "label cannot be empty"
+    if len(label) > 31:
+        return "label must be 31 chars or fewer (a-z 0-9 _ -)"
+    if not TTS_VOICE_LABEL_REGEX.fullmatch(label):
+        return "label must match ^[a-z0-9][a-z0-9_-]{0,30}$ (lowercase a-z 0-9 _ -)"
+    return None
+
+
 @mcp.tool()
 def tts_health() -> dict:
     """Health probe for the hiiq-andre Chatterbox TTS service.
@@ -908,9 +920,9 @@ def tts_health() -> dict:
     try:
         # /health is no-auth on the TTS service, but send the header anyway
         # so the gateway can fail-fast if the token isn't configured.
-        _tts_auth_headers()
+        headers = _tts_auth_headers()
         with httpx.Client(timeout=10.0) as client:
-            r = client.get(f"{TTS_SERVICE_URL}/health")
+            r = client.get(f"{TTS_SERVICE_URL}/health", headers=headers)
         body = r.json() if r.headers.get("content-type", "").startswith("application/json") else r.text
         return {
             "ok": r.status_code == 200,
@@ -972,6 +984,10 @@ def tts_save_voice(label: str, audio_b64: str, overwrite: bool = False) -> dict:
         On failure: dict with `error`.
     """
     require_authorized()
+    label = (label or "").strip()
+    label_error = _validate_tts_voice_label(label)
+    if label_error:
+        return {"error": label_error}
     payload = {"label": label, "audio_b64": audio_b64, "overwrite": overwrite}
     try:
         with httpx.Client(timeout=30.0) as client:
@@ -999,6 +1015,10 @@ def tts_delete_voice(label: str) -> dict:
         On failure: dict with `error` (e.g. label not found).
     """
     require_authorized()
+    label = (label or "").strip()
+    label_error = _validate_tts_voice_label(label)
+    if label_error:
+        return {"error": label_error}
     try:
         with httpx.Client(timeout=10.0) as client:
             r = client.delete(
@@ -1059,6 +1079,8 @@ def tts_generate(
     require_authorized()
     if not text or not text.strip():
         return {"error": "text cannot be empty"}
+    if len(text) > 8000:
+        return {"error": "text must be 8000 chars or fewer", "text_len": len(text)}
     if engine == "multilingual" and not language_id:
         return {"error": "language_id is required when engine='multilingual'"}
     if engine not in ("turbo", "regular", "multilingual"):
