@@ -795,7 +795,7 @@ def convert_document(
     output_formats = list(output_formats or ["md", "json"])
     timeout = float(timeout_seconds) if timeout_seconds else DOCLING_HTTP_TIMEOUT
     payload = {
-        "http_sources": [{"url": source_url.strip()}],
+        "sources": [{"kind": "http", "url": source_url.strip()}],
         "options": {
             "output_formats": output_formats,
         },
