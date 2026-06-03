@@ -1,11 +1,22 @@
 """
-HIIQ Edge MCP gateway v5.4 — adds Chatterbox TTS proxy tools (text-to-speech
-via hiiq-andre's RTX 5060) on top of v5.3 docling document conversion.
+HIIQ Edge MCP gateway v5.5 — upgrades recall_memory to HYBRID retrieval
+(pgvector HNSW + full-text → Reciprocal Rank Fusion → optional qwen3 rerank →
+top-K turn-start-first) on top of v5.4 Chatterbox TTS + v5.3 docling.
 
 Runs on the Hostinger VPS (mcp.hiiqbiz.com). Reaches Pacific PACOM at
-100.87.218.106:5430 and the hiiq-andre TTS service at 100.90.91.72:8019
-via the host's Tailscale interface. Reaches the sibling docling-serve
-container via the internal Coolify docker network.
+100.87.218.106:5430, the hiiq-andre TTS service at 100.90.91.72:8019, and the
+hiiq-andre qwen3 embedder/reranker (Ollama :11434) — all via the host's
+Tailscale interface. Reaches the sibling docling-serve container via the
+internal Coolify docker network.
+
+v5.5 — Hybrid recall (Phase 4 of the persistent-memory plan):
+  recall_memory now embeds the query through the 5060 qwen3 embedder
+  (Tailscale), runs hybrid_recall (vector + FTS → RRF), optionally reranks via
+  the 5060 cross-encoder, and returns a Primary/Additional top-K ordered most-
+  relevant-first (anti lost-in-the-middle). Degrades to the prior full-text-only
+  path when the query is empty OR the embedder is unreachable; the reranker
+  degrades to RRF-only when qwen3-reranker:4b isn't pulled on the 5060. No new
+  hard dependencies (httpx + psycopg2 already present).
 
 Auth: GitHub OAuth via FastMCP's GitHubProvider (DCR-compliant, Claude.ai-friendly).
 Per-tool gate: require_authorized() checks login against ALLOWED_GH_USERS.
@@ -39,14 +50,26 @@ Tools (21 total):
 
 import os
 import re
+import math
 import datetime
 import json
+import logging
 import httpx
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.github import GitHubProvider
 from fastmcp.server.dependencies import get_access_token, get_http_request
+
+# Phase 4 hybrid-retrieval modules (sibling files shipped with this gateway).
+# Both degrade gracefully: hybrid_recall raises only on programmer error
+# (bad table / empty query / missing embedding — all guarded by the caller),
+# and Reranker.rerank never raises (returns the RRF order unchanged when the
+# 5060 reranker is unreachable / unpulled).
+from hybrid_recall import hybrid_recall
+from reranker_client import Reranker
+
+logger = logging.getLogger("hiiq-edge")
 
 # --- PACOM connection ---
 PACOM_PG_HOST = os.environ.get("PACOM_PG_HOST", "100.87.218.106")
@@ -74,6 +97,31 @@ TTS_SERVICE_TOKEN = (
     os.environ.get("TTS_SERVICE_TOKEN")
     or os.environ.get("CB_MCP_AUTH_TOKEN", "")
 ).strip()
+
+# --- Hybrid recall: query embedder on hiiq-andre via Tailscale (v5.5) ---
+# recall_memory embeds the query through the same local qwen3 embedder PACOM
+# uses (qwen3-embedding:8b, MRL-truncated to 1024 dims + L2-normalized to match
+# the stored memories.embedding vector(1024) under cosine). The gateway runs on
+# the VPS, so ONLY the Tailscale endpoint is reachable — the 10.10.10.1 inter-rig
+# bridge that the 5070-local CLIs prefer is NOT routable from here. Endpoints are
+# tried in order; override with RECALL_EMBED_ENDPOINTS (comma-separated) if the
+# 5060's Tailscale IP changes. EMBED_DIM must match the memories.embedding column.
+RECALL_EMBED_MODEL = os.environ.get("RECALL_EMBED_MODEL", "qwen3-embedding:8b")
+RECALL_EMBED_DIM = int(os.environ.get("RECALL_EMBED_DIM", "1024"))
+_DEFAULT_EMBED_ENDPOINTS = "http://100.90.91.72:11434/api/embeddings"
+RECALL_EMBED_ENDPOINTS = tuple(
+    u.strip()
+    for u in os.environ.get("RECALL_EMBED_ENDPOINTS", _DEFAULT_EMBED_ENDPOINTS).split(",")
+    if u.strip()
+)
+RECALL_EMBED_TIMEOUT = float(os.environ.get("RECALL_EMBED_TIMEOUT", "20.0"))
+# Ollama's /api/embeddings errors (HTTP 500) when the prompt overflows the model
+# context. A char is never < 1 token, so <= 2000 chars is always <= 2000 tokens,
+# safely under qwen3-embedding's default 2048 ctx. Mirrors pacom.embed_text.
+RECALL_EMBED_MAX_CHARS = int(os.environ.get("RECALL_EMBED_MAX_CHARS", "2000"))
+# Hybrid pipeline knobs. RRF candidate pool (per modality) and final top-K.
+RECALL_HYBRID_POOL = int(os.environ.get("RECALL_HYBRID_POOL", "20"))   # rows fed to reranker
+RECALL_RRF_K = int(os.environ.get("RECALL_RRF_K", "60"))              # Cormack et al. default
 
 # --- OAuth ---
 GITHUB_CLIENT_ID = os.environ.get("GITHUB_OAUTH_CLIENT_ID", "").strip()
@@ -234,6 +282,74 @@ def get_pg_conn(readonly: bool = True):
 
 
 # ============================================================================
+# Query embedder for hybrid recall (v5.5)
+# ============================================================================
+# Mirrors pacom.embed_text on the 5070 so the query lands in the SAME vector
+# space as the stored embeddings: qwen3-embedding:8b → keep the first
+# RECALL_EMBED_DIM (1024) components (MRL truncation) → L2-normalize (cosine).
+# Pure-stdlib math, httpx for transport. NEVER raises — returns None so
+# recall_memory can fall back to the full-text path when the 5060 is asleep.
+
+
+def _l2_normalize(vec: list[float]) -> list[float]:
+    """L2-renormalize a vector. Returns the input unchanged if its norm is 0."""
+    norm = math.sqrt(sum(x * x for x in vec))
+    if norm == 0.0:
+        return vec
+    return [x / norm for x in vec]
+
+
+def embed_query(text: str) -> list[float] | None:
+    """Embed `text` to a length-RECALL_EMBED_DIM vector via the 5060 qwen3
+    embedder over Tailscale. Returns the MRL-truncated + L2-normalized list, or
+    None if every endpoint is unreachable / the payload is unusable. Never raises
+    — a None return is the graceful-degrade signal for recall_memory.
+    """
+    if not text or not text.strip():
+        return None
+    clipped = text[:RECALL_EMBED_MAX_CHARS]  # avoid the context-length HTTP 500
+    for url in RECALL_EMBED_ENDPOINTS:
+        try:
+            with httpx.Client(timeout=RECALL_EMBED_TIMEOUT) as client:
+                r = client.post(url, json={"model": RECALL_EMBED_MODEL, "prompt": clipped})
+            if r.status_code != 200:
+                logger.warning("embed_query: %s returned HTTP %s", url, r.status_code)
+                continue
+            data = r.json()
+        except Exception as e:  # network error, timeout, bad JSON — try next endpoint
+            logger.warning("embed_query: %s failed: %s", url, str(e)[:200])
+            continue
+        emb = data.get("embedding") if isinstance(data, dict) else None
+        if not isinstance(emb, list) or not emb:
+            continue
+        try:
+            raw = [float(x) for x in emb]
+        except (TypeError, ValueError):
+            continue
+        # qwen3's native dim (4096 for 8B) >= 1024. If a model ever emits fewer
+        # than the target dim, treat it as unusable rather than zero-padding into
+        # a different space (would corrupt cosine distance).
+        if len(raw) < RECALL_EMBED_DIM:
+            continue
+        return _l2_normalize(raw[:RECALL_EMBED_DIM])
+    return None
+
+
+# A single reranker instance, lazily built + reused (holds a pooled httpx.Client).
+# Safe to construct even when the model isn't pulled — every call degrades to a
+# pass-through slice. Host/model come from RERANK_HOST / RERANK_MODEL env (the
+# reranker_client defaults to the 5060 Tailscale IP).
+_RERANKER: Reranker | None = None
+
+
+def _get_reranker() -> Reranker:
+    global _RERANKER
+    if _RERANKER is None:
+        _RERANKER = Reranker()
+    return _RERANKER
+
+
+# ============================================================================
 # Existing read tools (unchanged from v4)
 # ============================================================================
 
@@ -246,7 +362,7 @@ def ping_hiiq() -> dict:
     out = {
         "status": "ok",
         "server": "HIIQ Edge MCP gateway",
-        "version": "v5.4 (docling + TTS proxy)",
+        "version": "v5.5 (hybrid recall + docling + TTS proxy)",
         "node": "hiiqbiz-vps (Hostinger KVM 4, US-Boston)",
         "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
         "authenticated_as": user,
@@ -425,8 +541,13 @@ def add_memory(
                 Default 'personal'.
         tags: List of tag strings. Optional.
         summary: One-line headline. Optional but recommended.
-        sensitivity: 'public' / 'private' / 'sensitive'. 'secret' rejected in v5
-                     (requires pgcrypto + passphrase wiring — coming in 4.7.1).
+        sensitivity: 'public' / 'private' / 'sensitive' / 'secret'. For 'secret',
+                     the content is pgcrypto-encrypted (PGP_SYM_ENCRYPT) into
+                     encrypted_payload using the gateway env HIIQ_MEMORY_PASSPHRASE;
+                     the plaintext `content` column is stored empty. If
+                     HIIQ_MEMORY_PASSPHRASE is unset, the write is rejected (no
+                     plaintext is ever persisted for the secret tier). Recall
+                     secret rows via recall_sensitive_memory(query, passphrase).
         confidence: 1..10. If >= 7 and author is Claude, decision_matrix_anchors
                     MUST be non-empty (forces citation of which Decision Matrix
                     rows justify this).
@@ -443,13 +564,21 @@ def add_memory(
     user = require_authorized()
     if not content or not content.strip():
         return {"error": "content cannot be empty"}
+    if sensitivity not in ("public", "private", "sensitive", "secret"):
+        return {"error": f"sensitivity must be one of public/private/sensitive/secret (got {sensitivity!r})"}
+    # Secret-tier writes are pgcrypto-encrypted. The passphrase is read from the
+    # gateway env at call time and NEVER logged/echoed. If it's unset we refuse
+    # the write rather than silently downgrade to plaintext (the secret-tier
+    # contract is "plaintext never touches disk").
+    secret_passphrase = None
     if sensitivity == "secret":
-        return {
-            "error": "sensitivity='secret' requires pgcrypto + passphrase wiring "
-            "(Phase 4.7.1). Use 'sensitive' for now or wait."
-        }
-    if sensitivity not in ("public", "private", "sensitive"):
-        return {"error": f"sensitivity must be one of public/private/sensitive (got {sensitivity!r})"}
+        secret_passphrase = os.environ.get("HIIQ_MEMORY_PASSPHRASE", "").strip()
+        if not secret_passphrase:
+            return {
+                "error": "sensitivity='secret' requires HIIQ_MEMORY_PASSPHRASE in the "
+                "gateway environment. Refusing to store secret-tier content as "
+                "plaintext. Set the env var (Coolify) or use 'sensitive'."
+            }
 
     tags = list(tags or [])
     decision_matrix_anchors = list(decision_matrix_anchors or [])
@@ -477,28 +606,54 @@ def add_memory(
             "Either lower confidence (Claude's default for unsupported claims) "
             "or cite at least one Decision-Matrix.md 'shape:' string."
         }
-    sql = """
-    INSERT INTO memories (
-        content, summary, memory_type, scope, author,
-        source_type, tags, related_ids,
-        confidence, decision_matrix_anchors, confidence_reasoning,
-        status, sensitivity, metadata
-    ) VALUES (
-        %s, %s, %s, %s, %s,
-        'mcp-gateway', %s, %s,
-        %s, %s, %s,
-        'pending', %s, %s
-    ) RETURNING id, ts, status
-    """
+    if sensitivity == "secret":
+        # Encrypt content into encrypted_payload via pgcrypto; store empty
+        # plaintext to satisfy memories_secret_payload_chk (content length 0 AND
+        # encrypted_payload NOT NULL). The passphrase is bound as a parameter —
+        # never interpolated, never logged.
+        sql = """
+        INSERT INTO memories (
+            content, encrypted_payload, summary, memory_type, scope, author,
+            source_type, tags, related_ids,
+            confidence, decision_matrix_anchors, confidence_reasoning,
+            status, sensitivity, metadata
+        ) VALUES (
+            '', PGP_SYM_ENCRYPT(%s, %s), %s, %s, %s, %s,
+            'mcp-gateway', %s, %s::uuid[],
+            %s, %s, %s,
+            'pending', %s, %s
+        ) RETURNING id, ts, status
+        """
+        params = (
+            content, secret_passphrase, summary, memory_type, scope, author,
+            tags, related_ids,
+            int(confidence), decision_matrix_anchors, confidence_reasoning,
+            sensitivity, Json(metadata),
+        )
+    else:
+        sql = """
+        INSERT INTO memories (
+            content, summary, memory_type, scope, author,
+            source_type, tags, related_ids,
+            confidence, decision_matrix_anchors, confidence_reasoning,
+            status, sensitivity, metadata
+        ) VALUES (
+            %s, %s, %s, %s, %s,
+            'mcp-gateway', %s, %s::uuid[],
+            %s, %s, %s,
+            'pending', %s, %s
+        ) RETURNING id, ts, status
+        """
+        params = (
+            content, summary, memory_type, scope, author,
+            tags, related_ids,
+            int(confidence), decision_matrix_anchors, confidence_reasoning,
+            sensitivity, Json(metadata),
+        )
     try:
         with get_pg_conn(readonly=False) as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (
-                    content, summary, memory_type, scope, author,
-                    tags, related_ids,
-                    int(confidence), decision_matrix_anchors, confidence_reasoning,
-                    sensitivity, Json(metadata),
-                ))
+                cur.execute(sql, params)
                 row = cur.fetchone()
                 conn.commit()
                 return {
@@ -515,39 +670,26 @@ def add_memory(
         return {"error": str(e)[:500]}
 
 
-@mcp.tool()
-def recall_memory(
-    query: str = "",
-    limit: int = 10,
-    memory_type: str = None,
-    scope: str = None,
-    author: str = None,
-    sensitivity_max: str = "sensitive",
-    include_pending: bool = True,
+# Sensitivity tiers the gateway will surface here. 'secret' is intentionally
+# absent — secret-tier rows are pgcrypto-encrypted and only readable through
+# recall_sensitive_memory(query, passphrase).
+_SENS_ORDER = {"public": 1, "private": 2, "sensitive": 3}
+
+
+def _recall_fulltext(
+    query: str,
+    limit: int,
+    memory_type: str,
+    scope: str,
+    author: str,
+    allowed_sens: list,
+    include_pending: bool,
 ) -> dict:
+    """Full-text-only recall (the original v5.4 path). This is the graceful-
+    degrade fallback when the query is empty (returns most-recent) or the 5060
+    embedder is unreachable (no query vector → no vector arm). Returns the
+    legacy {query, count, memories} shape so existing callers are unaffected.
     """
-    Full-text search the memories table (vector/semantic search coming when
-    embeddings are populated in Phase 4.8+).
-
-    Args:
-        query: Search terms (English plainto_tsquery). Empty string returns most recent.
-        limit: 1..50, default 10.
-        memory_type: Optional filter on type.
-        scope: Optional filter on scope.
-        author: Optional filter on author (e.g., 'andre', 'claude-via-hiiqbiz-wq').
-        sensitivity_max: Highest sensitivity tier to return. 'public' | 'private' | 'sensitive'.
-                         'secret' is NEVER returned here — use recall_sensitive_memory.
-        include_pending: If True (default), include pending memories. False = approved only.
-
-    Returns ranked memories with snippets where query matched.
-    """
-    require_authorized()
-    limit = max(1, min(50, int(limit)))
-
-    SENS_ORDER = {"public": 1, "private": 2, "sensitive": 3}
-    max_sens = SENS_ORDER.get(sensitivity_max, 2)
-    allowed_sens = [s for s, n in SENS_ORDER.items() if n <= max_sens]
-
     where = ["archived_at IS NULL", "sensitivity = ANY(%(allowed_sens)s)"]
     params = {"allowed_sens": allowed_sens, "limit": limit}
 
@@ -595,6 +737,169 @@ def recall_memory(
                 "count": len(rows),
                 "memories": rows,
             }
+
+
+@mcp.tool()
+def recall_memory(
+    query: str = "",
+    limit: int = 10,
+    memory_type: str = None,
+    scope: str = None,
+    author: str = None,
+    sensitivity_max: str = "sensitive",
+    include_pending: bool = True,
+    rerank: bool = True,
+) -> dict:
+    """
+    Hybrid recall over the memories table: pgvector HNSW (cosine over the 1024-dim
+    `embedding`) + full-text (ts_rank_cd) fused via Reciprocal Rank Fusion, then
+    optionally reranked by the 5060 qwen3 cross-encoder, returning the top-K
+    ordered MOST-RELEVANT-FIRST (anti lost-in-the-middle) with a Primary/Additional
+    split.
+
+    Degradation (both transparent — `retrieval` in the response says which path ran):
+      * Empty `query`  → most-recent rows (the plain list path; no ranking).
+      * 5060 embedder unreachable → full-text-only (ts_rank), same as the legacy path.
+      * qwen3-reranker:4b not pulled on the 5060 → RRF order kept (no rerank step).
+
+    Args:
+        query: Search terms. Empty string returns most-recent memories.
+        limit: Final top-K, 1..50, default 10.
+        memory_type: Optional equality filter on type.
+        scope: Optional equality filter on scope.
+        author: Optional equality filter on author (e.g. 'claude-code-pacific').
+        sensitivity_max: Highest tier to return — 'public' | 'private' | 'sensitive'.
+                         'secret' is NEVER returned here — use recall_sensitive_memory.
+        include_pending: If True (default), include pending rows. False = approved only.
+        rerank: If True (default), rerank the RRF candidate pool with the 5060
+                cross-encoder. Set False to skip the rerank hop (pure RRF order).
+
+    Returns (hybrid path):
+        dict with `query`, `mode`, `retrieval` (path + flags), `count`,
+        `primary` (top-1, the single most relevant — surfaced first to fight
+        lost-in-the-middle), `additional` (the rest, still relevance-ordered),
+        and `memories` (primary + additional concatenated, for callers that want
+        a flat list). Each row carries rrf_score / fts_rank / vec_rank and, when
+        reranked, rerank_score.
+    Returns (degrade path): the legacy {query, count, memories} shape.
+    """
+    require_authorized()
+    limit = max(1, min(50, int(limit)))
+
+    max_sens = _SENS_ORDER.get(sensitivity_max, 2)
+    allowed_sens = [s for s, n in _SENS_ORDER.items() if n <= max_sens]
+
+    has_query = bool(query and query.strip())
+
+    # --- Degrade path 1: no query → most-recent (no ranking to do) ---
+    if not has_query:
+        return _recall_fulltext(
+            query, limit, memory_type, scope, author, allowed_sens, include_pending
+        )
+
+    # --- Try the hybrid path: embed the query through the 5060 qwen3 embedder ---
+    query_embedding = embed_query(query)
+
+    # --- Degrade path 2: embedder unreachable → full-text only ---
+    if query_embedding is None:
+        out = _recall_fulltext(
+            query, limit, memory_type, scope, author, allowed_sens, include_pending
+        )
+        out["mode"] = "fulltext-only"
+        out["retrieval"] = {
+            "path": "fulltext",
+            "reason": "query embedding unavailable (5060 embedder unreachable)",
+            "vector": False,
+            "rerank": False,
+        }
+        return out
+
+    # Pre-rank metadata filters applied INSIDE both CTEs (so RRF ranks reflect the
+    # eligible candidate set). sensitivity = allowed tiers (ANY) preserves the
+    # secret-never-returned gate; status='approved' when pending is excluded.
+    filters: dict = {"sensitivity": allowed_sens}
+    if not include_pending:
+        filters["status"] = "approved"
+    if memory_type:
+        filters["memory_type"] = memory_type
+    if scope:
+        filters["scope"] = scope
+    if author:
+        filters["author"] = author
+
+    # Candidate pool depth: pull at least `limit`, but a generous pool (default 20)
+    # so the reranker has real choice. hybrid_recall clamps + over-pulls per arm.
+    pool = max(limit, RECALL_HYBRID_POOL)
+
+    try:
+        with get_pg_conn(readonly=True) as conn:
+            candidates = hybrid_recall(
+                conn,
+                query,
+                query_embedding,
+                table="memories",
+                limit=pool,
+                filters=filters,
+                rrf_k=RECALL_RRF_K,
+            )
+    except Exception as e:
+        # Any SQL/connection failure in the hybrid arm → fall back to full-text
+        # rather than erroring out the recall entirely.
+        logger.warning("hybrid_recall failed, falling back to full-text: %s", str(e)[:300])
+        out = _recall_fulltext(
+            query, limit, memory_type, scope, author, allowed_sens, include_pending
+        )
+        out["mode"] = "fulltext-only"
+        out["retrieval"] = {
+            "path": "fulltext",
+            "reason": f"hybrid arm error: {str(e)[:200]}",
+            "vector": False,
+            "rerank": False,
+        }
+        return out
+
+    # --- Optional rerank: cross-encoder over the RRF pool → top-K ---
+    reranked = False
+    if rerank and candidates:
+        ranked = _get_reranker().rerank(query, candidates, text_key="content", top_k=limit)
+        # The reranker degrades to candidates[:top_k] UNCHANGED (no rerank_score)
+        # when the 5060 model isn't pulled / host is down. Detect a real rerank by
+        # the presence of a rerank_score on any returned row; otherwise keep the
+        # RRF order (already correct), trimmed to limit.
+        reranked = any(r.get("rerank_score") is not None for r in ranked)
+        final = ranked if reranked else candidates[:limit]
+    else:
+        final = candidates[:limit]
+
+    # Normalize transport types (ts → iso, decimals already floats from helpers).
+    for r in final:
+        if r.get("ts") is not None and hasattr(r["ts"], "isoformat"):
+            r["ts"] = r["ts"].isoformat()
+
+    # Anti lost-in-the-middle: most-relevant first, and split out the single best
+    # as `primary` so the consuming turn leads with it.
+    primary = final[0] if final else None
+    additional = final[1:] if len(final) > 1 else []
+
+    return {
+        "query": query,
+        "mode": "hybrid",
+        "retrieval": {
+            "path": "hybrid",
+            "vector": True,
+            "fts": True,
+            "rrf_k": RECALL_RRF_K,
+            "candidate_pool": len(candidates),
+            "rerank_requested": bool(rerank),
+            "rerank_applied": reranked,
+            "embed_model": RECALL_EMBED_MODEL,
+            "embed_dim": RECALL_EMBED_DIM,
+        },
+        "count": len(final),
+        "primary": primary,
+        "additional": additional,
+        "memories": final,
+    }
 
 
 @mcp.tool()
@@ -715,25 +1020,82 @@ def archive_memory(id: str, reason: str = None) -> dict:
 
 
 @mcp.tool()
-def recall_sensitive_memory(query: str, passphrase: str) -> dict:
+def recall_sensitive_memory(query: str = "", passphrase: str = "", limit: int = 10) -> dict:
     """
     Recall 'secret'-tier memories (pgcrypto-encrypted). Requires the passphrase
-    Andre holds — never stored on VPS.
+    Andre holds — never stored on the VPS, never logged or echoed.
 
-    STATUS: stub in v5. The pgcrypto encrypt/decrypt path lands in Phase 4.7.1
-    when HIIQ_MEMORY_PASSPHRASE is wired through. For now, this tool reports
-    that and returns nothing.
+    Decrypts encrypted_payload via PGP_SYM_DECRYPT using the supplied passphrase
+    (falling back to the gateway env HIIQ_MEMORY_PASSPHRASE if the arg is empty),
+    then filters secret rows whose decrypted text matches `query` (case-insensitive
+    substring). A wrong passphrase makes PGP_SYM_DECRYPT raise ("Wrong key or
+    corrupt data"); that is surfaced as a generic decryption error without leaking
+    the passphrase.
+
+    Args:
+        query: Case-insensitive substring to match against decrypted content.
+               Empty string returns all secret rows (still passphrase-gated).
+        passphrase: The master passphrase. If empty, falls back to the gateway's
+                    HIIQ_MEMORY_PASSPHRASE env var.
+        limit: 1..50, default 10.
+
+    Returns:
+        dict with `count` and `memories` (decrypted `content` plus summary/type/
+        scope/author/ts/status metadata). On failure: dict with `error`.
     """
     require_authorized()
-    return {
-        "status": "not-implemented",
-        "phase": "4.7.1",
-        "note": (
-            "secret-tier memories require pgcrypto + master passphrase wiring. "
-            "Coming next iteration. For now, use sensitivity='sensitive' which "
-            "stores plaintext but is segregated from default queries."
-        ),
-    }
+    limit = max(1, min(50, int(limit)))
+    pp = (passphrase or "").strip() or os.environ.get("HIIQ_MEMORY_PASSPHRASE", "").strip()
+    if not pp:
+        return {
+            "error": "No passphrase supplied and HIIQ_MEMORY_PASSPHRASE is unset on "
+            "the gateway. Cannot decrypt secret-tier memories."
+        }
+
+    has_query = bool(query and query.strip())
+    # Decrypt in the SELECT, filter on the decrypted output. The passphrase is
+    # bound as a parameter (never interpolated). ILIKE wildcards are escaped so a
+    # query containing % or _ is matched literally.
+    where = ["sensitivity = 'secret'", "archived_at IS NULL", "encrypted_payload IS NOT NULL"]
+    params = {"pp": pp, "limit": limit}
+    if has_query:
+        where.append(
+            "PGP_SYM_DECRYPT(encrypted_payload, %(pp)s) ILIKE %(pat)s ESCAPE '\\'"
+        )
+        esc = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        params["pat"] = f"%{esc}%"
+
+    sql = f"""
+    SELECT id,
+           PGP_SYM_DECRYPT(encrypted_payload, %(pp)s) AS content,
+           summary, memory_type, scope, author, ts, status,
+           sensitivity, confidence, decision_matrix_anchors, tags,
+           verified_by, verified_at
+    FROM memories
+    WHERE {' AND '.join(where)}
+    ORDER BY ts DESC
+    LIMIT %(limit)s
+    """
+    try:
+        with get_pg_conn(readonly=True) as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(sql, params)
+                rows = [dict(r) for r in cur.fetchall()]
+                for r in rows:
+                    r["id"] = str(r["id"])
+                return {
+                    "query": query or None,
+                    "count": len(rows),
+                    "memories": rows,
+                }
+    except Exception as e:
+        # Wrong passphrase / corrupt payload raises here. Surface a generic
+        # message — do NOT include the passphrase or the raw decrypt error verbatim
+        # if it could echo key material (pgcrypto's message does not, but stay safe).
+        msg = str(e)
+        if "Wrong key" in msg or "corrupt data" in msg or "decrypt" in msg.lower():
+            return {"error": "decryption failed — wrong passphrase or corrupt payload"}
+        return {"error": msg[:500]}
 
 
 # ============================================================================
