@@ -1,7 +1,7 @@
-fastmcp
-aiohttp>=3.8.0
-beautifulsoup4>=4.12.0
-lxml>=4.9.0
-gunicorn>=20.1.0
-psycopg2-binary>=2.9.9
-httpx>=0.27
+fastmcp>=3.4.0
+aiohttp>=3.14.0
+beautifulsoup4>=4.14.0
+lxml>=6.1.0
+gunicorn>=26.0.0
+psycopg2-binary>=2.9.12
+httpx>=0.28.0
