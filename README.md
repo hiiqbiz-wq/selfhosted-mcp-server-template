@@ -330,6 +330,14 @@ python local-seo-checker.py
 npx @modelcontextprotocol/inspector
 ```
 
+### Chronicle Tips (Remote Gateway)
+
+If you are running `remote-seo-checker.py` against a PACOM database that
+collects session history (`cli_audit`, `session_handoff`), you can request
+personalized usage tips via the `chronicle` tool:
+
+- `/chronicle tips` (or call `chronicle(command="tips")`)
+
 ### Contributing
 
 1. Fork the repository

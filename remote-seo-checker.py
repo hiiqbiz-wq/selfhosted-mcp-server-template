@@ -54,6 +54,7 @@ import math
 import datetime
 import json
 import logging
+from collections import Counter
 import httpx
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
@@ -508,6 +509,291 @@ def session_resume(only_unconsumed: bool = True, limit: int = 5) -> dict:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(sql, (limit,))
             return {"handoffs": [dict(r) for r in cur.fetchall()]}
+
+
+def _quantile(values: list[float], q: float) -> float | None:
+    """Return the q-quantile of values (0..1) using nearest-rank on sorted data."""
+    if not values:
+        return None
+    q = max(0.0, min(1.0, float(q)))
+    xs = sorted(float(v) for v in values)
+    idx = int(round(q * (len(xs) - 1)))
+    return xs[idx]
+
+
+def _is_error_status(status) -> bool:
+    """Best-effort classification of cli_audit.status into success vs error."""
+    if status is None:
+        return False
+    s = str(status).strip().lower()
+    if not s:
+        return False
+    if s in {"ok", "success", "succeeded", "passed"}:
+        return False
+    if s.isdigit():
+        return not s.startswith("2")
+    if s.startswith("2"):
+        return False
+    # Default: treat anything non-empty and non-success-looking as an error-ish signal.
+    return True
+
+
+def _safe_ratio(n: int, d: int) -> float:
+    return float(n) / float(d) if d else 0.0
+
+
+def _fetch_cli_audit(
+    *,
+    since: datetime.datetime,
+    rig: str | None,
+    limit: int,
+) -> list[dict]:
+    limit = max(1, min(2000, int(limit)))
+    where = ["ts >= %(since)s"]
+    params: dict = {"since": since, "limit": limit}
+    if rig:
+        where.append("rig_hostname = %(rig)s")
+        params["rig"] = rig
+    sql = f"""
+    SELECT ts, rig_hostname, tool_name, args, backend, endpoint,
+           status, error_message, duration_ms
+    FROM cli_audit
+    WHERE {' AND '.join(where)}
+    ORDER BY ts DESC
+    LIMIT %(limit)s
+    """
+    with get_pg_conn(readonly=True) as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, params)
+            return [dict(r) for r in cur.fetchall()]
+
+
+def _fetch_session_handoffs(
+    *,
+    since: datetime.datetime,
+    rig: str | None,
+    limit: int,
+) -> list[dict]:
+    limit = max(1, min(500, int(limit)))
+    where = ["ended_at >= %(since)s"]
+    params: dict = {"since": since, "limit": limit}
+    if rig:
+        where.append("rig_hostname = %(rig)s")
+        params["rig"] = rig
+    sql = f"""
+    SELECT session_id, rig_hostname, ended_at, last_command,
+           current_chapter, next_action, raw_handoff, consumed_at
+    FROM session_handoff
+    WHERE {' AND '.join(where)}
+    ORDER BY ended_at DESC NULLS LAST
+    LIMIT %(limit)s
+    """
+    with get_pg_conn(readonly=True) as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, params)
+            return [dict(r) for r in cur.fetchall()]
+
+
+@mcp.tool()
+def chronicle_tips(
+    days: int = 14,
+    max_cli_entries: int = 200,
+    max_handoffs: int = 50,
+    rig: str = None,
+    include_examples: bool = False,
+) -> dict:
+    """Analyze recent PACOM session history and recommend usage tips.
+
+    This is intended to back a client-side command like `/chronicle tips`.
+
+    Sources:
+      - cli_audit: recent CLI/tool activity (errors, durations, top tools)
+      - session_handoff: recent session handoffs (next_action hygiene, backlog)
+
+    Args:
+        days: Lookback window in days (1..90). Default 14.
+        max_cli_entries: Max cli_audit rows to analyze (1..2000). Default 200.
+        max_handoffs: Max session_handoff rows to analyze (1..500). Default 50.
+        rig: Optional override for rig hostname filter. If omitted, uses the
+             validated `x-hiiq-rig` header from the request when available.
+        include_examples: If True, include small samples of recent rows to help
+             interpret the tips.
+    """
+    user = require_authorized()
+    surface, _ua, detected_rig = detect_caller_surface()
+    rig_filter = (rig or "").strip().lower() or detected_rig
+    days = max(1, min(90, int(days)))
+    since = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc) - datetime.timedelta(days=days)
+
+    try:
+        cli_rows = _fetch_cli_audit(since=since, rig=rig_filter, limit=max_cli_entries)
+        handoffs = _fetch_session_handoffs(since=since, rig=rig_filter, limit=max_handoffs)
+    except Exception as e:
+        return {
+            "error": f"Unable to query PACOM session history: {str(e)[:300]}",
+            "caller": {"authenticated_as": user, "surface": surface, "rig": rig_filter},
+            "hint": (
+                "Check PACOM connectivity (ping_hiiq) and PACOM_* env vars on the gateway. "
+                "If you're expecting per-rig filtering, ensure your client sets the "
+                f"'{RIG_HEADER_NAME}' header (e.g. 'pacific', 'central')."
+            ),
+        }
+
+    tool_counts = Counter((r.get("tool_name") or "unknown") for r in cli_rows)
+    total_cli = len(cli_rows)
+    error_cli = sum(1 for r in cli_rows if _is_error_status(r.get("status")))
+    durations = [
+        float(r["duration_ms"])
+        for r in cli_rows
+        if r.get("duration_ms") is not None and str(r.get("duration_ms")).strip() != ""
+    ]
+    p50_ms = _quantile(durations, 0.50)
+    p90_ms = _quantile(durations, 0.90)
+
+    unconsumed = [h for h in handoffs if h.get("consumed_at") is None]
+    missing_next_action = [h for h in handoffs if not (h.get("next_action") or "").strip()]
+    missing_chapter = [h for h in handoffs if not (h.get("current_chapter") or "").strip()]
+
+    # Lightweight keyword scan over last_command for "what are you actually doing?"
+    cmd_hits = Counter()
+    for h in handoffs:
+        cmd = (h.get("last_command") or "").lower()
+        for key in ("recall_memory", "add_memory", "query_pacom", "search_vault", "convert_document", "tts_generate"):
+            if key in cmd:
+                cmd_hits[key] += 1
+
+    tips: list[str] = []
+
+    if rig_filter is None:
+        tips.append(
+            f"Set the '{RIG_HEADER_NAME}' header in your MCP client so tips can be scoped per rig."
+        )
+    if total_cli == 0 and not handoffs:
+        tips.append(
+            "No recent history found in PACOM for this window. If you expected data, confirm the "
+            "save-pacom/session logging pipeline is writing to cli_audit and session_handoff."
+        )
+
+    if total_cli:
+        err_rate = _safe_ratio(error_cli, total_cli)
+        if err_rate >= 0.25:
+            tips.append(
+                f"High error rate in recent activity ({error_cli}/{total_cli}). Start with ping_hiiq, "
+                "then inspect the most common failing command/tool to remove repeated friction."
+            )
+        elif err_rate >= 0.10:
+            tips.append(
+                f"Moderate error rate ({error_cli}/{total_cli}). Skim the latest failures first and "
+                "fix the top 1–2 root causes to reduce context switches."
+            )
+
+        if tool_counts:
+            top_tool, top_n = tool_counts.most_common(1)[0]
+            if _safe_ratio(top_n, total_cli) >= 0.60 and top_tool != "unknown":
+                tips.append(
+                    f"You're heavily relying on '{top_tool}' (~{int(100*_safe_ratio(top_n, total_cli))}% of entries). "
+                    "Consider batching or adding a higher-level helper so you run it fewer times per session."
+                )
+
+        if p90_ms is not None and p90_ms >= 10000:
+            tips.append(
+                f"Your slower operations are very slow (p90 ~{int(p90_ms)}ms). If these are expected (e.g. "
+                "document conversion), increase client timeouts or split work into smaller chunks."
+            )
+        elif p90_ms is not None and p90_ms >= 3000:
+            tips.append(
+                f"Some operations are noticeably slow (p90 ~{int(p90_ms)}ms). Prefer narrower queries/limits and "
+                "avoid repeating expensive calls with small parameter changes."
+            )
+
+    if handoffs:
+        if unconsumed:
+            tips.append(
+                f"You have {len(unconsumed)} unconsumed session handoff(s). Use session_resume() regularly to "
+                "pull forward the latest next_action and avoid duplicated work."
+            )
+        if missing_next_action and _safe_ratio(len(missing_next_action), len(handoffs)) >= 0.30:
+            tips.append(
+                "Many handoffs lack a clear next_action. Ending sessions with a single concrete next step "
+                "(command + expected outcome) makes resuming faster."
+            )
+        if missing_chapter and _safe_ratio(len(missing_chapter), len(handoffs)) >= 0.30:
+            tips.append(
+                "Many handoffs lack a current_chapter. Adding a short chapter label (e.g. 'Refactor', "
+                "'Debug', 'Ship') helps you rehydrate context quickly."
+            )
+
+    if cmd_hits.get("recall_memory", 0) >= 5 and cmd_hits.get("add_memory", 0) <= 1:
+        tips.append(
+            "You're recalling memories often but not saving new ones. When you discover a stable rule or "
+            "decision, add_memory(summary=..., content=...) to reduce repeat reasoning later."
+        )
+
+    if not tips:
+        tips.append(
+            "Your recent sessions look consistent. Keep doing quick handoffs, and prefer one clear next_action "
+            "to make resumes deterministic."
+        )
+
+    out = {
+        "caller": {"authenticated_as": user, "surface": surface, "rig": rig_filter},
+        "window": {"days": days, "since_utc": since.isoformat()},
+        "sources": {
+            "cli_audit": {"count": total_cli, "filtered_by_rig": rig_filter},
+            "session_handoff": {"count": len(handoffs), "unconsumed": len(unconsumed), "filtered_by_rig": rig_filter},
+        },
+        "summary": {
+            "top_cli_tools": tool_counts.most_common(10),
+            "cli_error_rate": round(_safe_ratio(error_cli, total_cli), 4) if total_cli else 0.0,
+            "duration_ms_p50": int(p50_ms) if p50_ms is not None else None,
+            "duration_ms_p90": int(p90_ms) if p90_ms is not None else None,
+            "handoff_missing_next_action": len(missing_next_action),
+            "handoff_missing_current_chapter": len(missing_chapter),
+            "handoff_command_hints": cmd_hits.most_common(10),
+        },
+        "tips": tips,
+    }
+
+    if include_examples:
+        out["examples"] = {
+            "cli_audit": cli_rows[:10],
+            "session_handoff": handoffs[:5],
+        }
+
+    return out
+
+
+@mcp.tool()
+def chronicle(
+    command: str = "tips",
+    days: int = 14,
+    max_cli_entries: int = 200,
+    max_handoffs: int = 50,
+    rig: str = None,
+    include_examples: bool = False,
+) -> dict:
+    """Multi-action chronicle entrypoint (client-friendly).
+
+    Intended for chat UIs that express tools as slash commands like:
+      `/chronicle tips`
+
+    Currently supported commands:
+      - tips: analyze recent activity and return recommendations
+    """
+    cmd = (command or "").strip().lower()
+    if cmd in {"tips", "tip"}:
+        return chronicle_tips(
+            days=days,
+            max_cli_entries=max_cli_entries,
+            max_handoffs=max_handoffs,
+            rig=rig,
+            include_examples=include_examples,
+        )
+    return {
+        "error": f"Unknown chronicle command: {command!r}",
+        "available_commands": ["tips"],
+        "usage": "chronicle(command='tips', days=14, ...)",
+    }
 
 
 # ============================================================================
