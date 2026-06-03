@@ -12,14 +12,13 @@ Comprehensive SEO analysis tool for checking:
 - Mobile-friendliness indicators
 """
 
-import asyncio
 import json
 import logging
 import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 import aiohttp
 from bs4 import BeautifulSoup
 from fastmcp import FastMCP

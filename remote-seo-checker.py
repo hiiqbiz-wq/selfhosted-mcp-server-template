@@ -52,7 +52,6 @@ import os
 import re
 import math
 import datetime
-import json
 import logging
 import httpx
 import psycopg2
