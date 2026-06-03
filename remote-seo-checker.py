@@ -148,6 +148,42 @@ HIIQ_RIG_ALLOWLIST = {
 }  # empty set = no allowlist enforcement; any regex-valid rig passes
 
 
+# --- OAuth state persistence (M, 2026-06-03) ---
+# On headless Linux, FastMCP's default OAuth signing key is ephemeral (random
+# per boot) and its DCR client store defaults to memory -> EVERY redeploy
+# invalidates the claude.ai connector ("user must reconnect"). Persist both:
+#   1. a STABLE jwt_signing_key from env (issued tokens survive restart), and
+#   2. a durable client_storage in PACOM (DCR registrations survive restart).
+# The gateway already hard-depends on PACOM, so this adds no new failure mode.
+# Both are best-effort: a storage-init failure degrades to ephemeral (today's
+# behavior) rather than crashing the boot.
+_JWT_SIGNING_KEY = os.environ.get("JWT_SIGNING_KEY", "").strip() or None
+_oauth_client_storage = None
+try:
+    from key_value.aio.stores.postgresql import PostgreSQLStore
+    _oauth_client_storage = PostgreSQLStore(
+        host=PACOM_PG_HOST,
+        port=PACOM_PG_PORT,
+        database=PACOM_PG_DBNAME,
+        user=PACOM_PG_USER,
+        password=PACOM_PG_PASSWORD,
+        table_name="oauth_client_store",
+        auto_create=True,
+    )
+    print("[boot] OAuth client_storage: PostgreSQLStore(oauth_client_store) on PACOM", flush=True)
+except Exception as e:
+    print(
+        f"[boot] WARNING: OAuth client_storage unavailable ({e!r}); using ephemeral store "
+        "(connector will need reconnect on each redeploy).",
+        flush=True,
+    )
+if not _JWT_SIGNING_KEY:
+    print(
+        "[boot] WARNING: JWT_SIGNING_KEY unset -- issued tokens won't survive restart. "
+        "Set it in the Coolify env.",
+        flush=True,
+    )
+
 if GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET:
     auth = GitHubProvider(
         client_id=GITHUB_CLIENT_ID,
@@ -155,6 +191,8 @@ if GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET:
         base_url=PUBLIC_BASE_URL,
         redirect_path="/auth/callback",
         required_scopes=["read:user"],
+        jwt_signing_key=_JWT_SIGNING_KEY,
+        client_storage=_oauth_client_storage,
         allowed_client_redirect_uris=[
             "https://claude.ai/api/mcp/auth_callback",
             "https://claude.com/api/mcp/auth_callback",
@@ -631,24 +669,33 @@ def add_memory(
             sensitivity, Json(metadata),
         )
     else:
+        # Embed-on-write (N, 2026-06-03): embed the content at insert time so the
+        # gateway's hybrid recall vector arm is populated for memories written via
+        # THIS path (not just the add-memory CLI). Best-effort: if the 5060 embedder
+        # is unreachable, embed_query() returns None -> store a NULL embedding and
+        # the periodic backfill_memories drain on the 5070 backstops it. Secret tier
+        # is intentionally NOT embedded (content is encrypted + excluded from
+        # recall_memory), so this lives only in the non-secret branch.
+        _vec = embed_query(content)
+        _emb_literal = ("[" + ",".join(repr(float(x)) for x in _vec) + "]") if _vec else None
         sql = """
         INSERT INTO memories (
             content, summary, memory_type, scope, author,
             source_type, tags, related_ids,
             confidence, decision_matrix_anchors, confidence_reasoning,
-            status, sensitivity, metadata
+            status, sensitivity, metadata, embedding
         ) VALUES (
             %s, %s, %s, %s, %s,
             'mcp-gateway', %s, %s::uuid[],
             %s, %s, %s,
-            'pending', %s, %s
+            'pending', %s, %s, %s::vector
         ) RETURNING id, ts, status
         """
         params = (
             content, summary, memory_type, scope, author,
             tags, related_ids,
             int(confidence), decision_matrix_anchors, confidence_reasoning,
-            sensitivity, Json(metadata),
+            sensitivity, Json(metadata), _emb_literal,
         )
     try:
         with get_pg_conn(readonly=False) as conn:
