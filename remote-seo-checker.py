@@ -794,7 +794,7 @@ def recall_memory(
     scope: str = None,
     author: str = None,
     sensitivity_max: str = "sensitive",
-    include_pending: bool = True,
+    include_pending: bool = False,
     rerank: bool = True,
 ) -> dict:
     """
@@ -817,7 +817,8 @@ def recall_memory(
         author: Optional equality filter on author (e.g. 'claude-code-pacific').
         sensitivity_max: Highest tier to return — 'public' | 'private' | 'sensitive'.
                          'secret' is NEVER returned here — use recall_sensitive_memory.
-        include_pending: If True (default), include pending rows. False = approved only.
+        include_pending: If False (default), return APPROVED (verified) rows only — the
+                         authoritative layer. Set True to also include pending (unverified) rows.
         rerank: If True (default), rerank the RRF candidate pool with the 5060
                 cross-encoder. Set False to skip the rerank hop (pure RRF order).
 
