@@ -1518,6 +1518,154 @@ def tts_generate(
 
 
 # ============================================================================
+# Approval + audit spine (Phase 2 of the control-plane plan) — brakes before
+# the engine. dangerous_action_request() records a PENDING approval that ONLY
+# Andre can resolve; future mutating tools call require_approval(action) before
+# executing an irreversible action. PACOM table: public.approvals (migration 15).
+# ============================================================================
+
+class ApprovalRequired(Exception):
+    """Raised by require_approval() when no approved, unexpired approval exists
+    for an action. Future mutating tools catch this and return a structured
+    'approval required' result instead of performing the irreversible action."""
+
+
+def require_approval(action: str) -> dict:
+    """Gate for irreversible actions. Return the most recent approved + unexpired
+    approval row for `action`, or raise ApprovalRequired. The Phase-2 contract
+    every future mutating tool (email.send, infra.*, spend.*) plugs into."""
+    with get_pg_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id, action, status, resolved_by, resolved_at, expires_at "
+                "FROM public.approvals "
+                "WHERE action = %s AND status = 'approved' "
+                "  AND (expires_at IS NULL OR expires_at > now()) "
+                "ORDER BY resolved_at DESC NULLS LAST LIMIT 1",
+                (action,),
+            )
+            row = cur.fetchone()
+    if not row:
+        raise ApprovalRequired(
+            f"No approved approval for action '{action}'. Call "
+            f"dangerous_action_request('{action}', ...) and have Andre approval_resolve it."
+        )
+    return dict(row)
+
+
+@mcp.tool()
+def dangerous_action_request(action: str, payload: dict = None, reason: str = None, ttl_hours: int = 24) -> dict:
+    """Request approval for a dangerous / irreversible action. Records a PENDING
+    approval in PACOM that ONLY Andre can resolve (approval_resolve). Does NOT
+    execute the action — the requesting tool re-checks for an approved row first.
+
+    Args:
+        action: short dotted key for the action, e.g. 'email.send'.
+        payload: the proposed action's parameters (stored as JSON for the audit trail).
+        reason: why the action is wanted (shown to Andre).
+        ttl_hours: hours until an unresolved request expires (default 24, max 720).
+    """
+    user = require_authorized()
+    payload = payload or {}
+    ttl = max(1, min(720, int(ttl_hours)))
+    sql = """
+    INSERT INTO public.approvals (action, payload, reason, requested_by, expires_at)
+    VALUES (%s, %s::jsonb, %s, %s, now() + make_interval(hours => %s))
+    RETURNING id, status, requested_at, expires_at
+    """
+    try:
+        with get_pg_conn(readonly=False) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (action, json.dumps(payload), reason, user, ttl))
+                row = cur.fetchone()
+                conn.commit()
+        return {
+            "request_id": str(row[0]),
+            "status": row[1],
+            "action": action,
+            "requested_by": user,
+            "requested_at": row[2].isoformat() if row[2] else None,
+            "expires_at": row[3].isoformat() if row[3] else None,
+            "next": "Andre must approve via approval_resolve(request_id, 'approve') before the action runs.",
+        }
+    except Exception as e:
+        return {"error": str(e)[:500]}
+
+
+@mcp.tool()
+def approval_resolve(request_id: str, decision: str, note: str = None) -> dict:
+    """Andre-only: approve or deny a pending dangerous_action_request.
+
+    Args:
+        request_id: UUID returned by dangerous_action_request.
+        decision: 'approve' or 'deny'.
+        note: optional resolution note (kept in the audit trail).
+    """
+    user = require_andre()
+    d = (decision or "").strip().lower()
+    if d not in ("approve", "approved", "deny", "denied"):
+        return {"error": "decision must be 'approve' or 'deny'"}
+    new_status = "approved" if d.startswith("approve") else "denied"
+    sql = """
+    UPDATE public.approvals
+    SET status = %s, resolved_by = %s, resolved_at = now(), resolution_note = %s
+    WHERE id = %s AND status = 'pending'
+    RETURNING id, action, status, resolved_at
+    """
+    try:
+        with get_pg_conn(readonly=False) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (new_status, user, note, request_id))
+                row = cur.fetchone()
+                conn.commit()
+        if not row:
+            return {"error": f"No pending approval with id={request_id} (already resolved, expired, or unknown)."}
+        return {
+            "id": str(row[0]),
+            "action": row[1],
+            "status": row[2],
+            "resolved_by": user,
+            "resolved_at": row[3].isoformat() if row[3] else None,
+        }
+    except Exception as e:
+        return {"error": str(e)[:500]}
+
+
+@mcp.tool()
+def mcp_tool_audit() -> dict:
+    """Enumerate the gateway's registered tools + resources with their auth tier
+    (andre_only vs authorized). Read-only governance surface — shows the full
+    permission surface of everything the gateway exposes."""
+    require_authorized()
+    import asyncio
+    andre_only = {"verify_memory", "archive_memory", "approval_resolve"}
+
+    async def _collect():
+        tools, resources = [], []
+        get_t = getattr(mcp, "get_tools", None) or getattr(mcp, "list_tools", None)
+        get_r = getattr(mcp, "get_resources", None) or getattr(mcp, "list_resources", None)
+        if get_t:
+            t = await get_t()
+            tools = sorted(t.keys()) if isinstance(t, dict) else sorted(getattr(x, "name", str(x)) for x in t)
+        if get_r:
+            r = await get_r()
+            resources = sorted(r.keys()) if isinstance(r, dict) else sorted(str(getattr(x, "uri", x)) for x in r)
+        return tools, resources
+
+    try:
+        tools, resources = asyncio.run(_collect())
+    except Exception as e:
+        return {"error": str(e)[:300]}
+    return {
+        "tool_count": len(tools),
+        "resource_count": len(resources),
+        "andre_only_tools": [t for t in tools if t in andre_only],
+        "authorized_tools": [t for t in tools if t not in andre_only],
+        "resources": resources,
+    }
+
+
+# ============================================================================
 # MCP Resources (Phase 1 of the control-plane plan) — read-only context.
 # ============================================================================
 # Resources expose read-only state agents would otherwise burn tool calls
@@ -1700,6 +1848,36 @@ def resource_tasks_open() -> str:
             out["file_mtime"] = row["mtime"]
             out["indexed_at"] = row["indexed_at"]
             out["content"] = row["content_text"]
+    except Exception as e:
+        out["ok"] = False
+        out["error"] = str(e)[:300]
+    return json.dumps(out, indent=2, default=str)
+
+
+@mcp.resource(
+    "hiiq://governance/approvals",
+    name="HIIQ Approvals Log",
+    description="Read-only approval-spine state: status counts + the 50 most recent approval "
+                "requests/resolutions. The audit trail for dangerous_action_request / "
+                "approval_resolve (control-plane Phase 2).",
+    mime_type="application/json",
+    tags={"hiiq", "governance", "approvals"},
+)
+def resource_governance_approvals() -> str:
+    require_authorized()
+    out = {"generated_at": _utc_now_z()}
+    try:
+        with get_pg_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT status, count(*) AS n FROM public.approvals GROUP BY status")
+                out["counts"] = {r["status"]: r["n"] for r in cur.fetchall()}
+                cur.execute(
+                    "SELECT id, action, status, reason, requested_by, requested_at, "
+                    "resolved_by, resolved_at, resolution_note, expires_at "
+                    "FROM public.approvals ORDER BY requested_at DESC LIMIT 50"
+                )
+                out["recent"] = [dict(r) for r in cur.fetchall()]
+        out["ok"] = True
     except Exception as e:
         out["ok"] = False
         out["error"] = str(e)[:300]
