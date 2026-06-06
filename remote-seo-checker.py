@@ -1666,6 +1666,109 @@ def mcp_tool_audit() -> dict:
 
 
 # ============================================================================
+# Memory recall eval (Phase 3 of the control-plane plan) — measurable recall.
+# ============================================================================
+# memory_eval_run() scores the production recall pipeline against a golden set
+# (memory_eval_golden, migration 16): for each (query, expect) it runs the SAME
+# path recall_memory uses (embed -> hybrid_recall over approved `memories` ->
+# optional rerank) and checks whether `expect` (case-insensitive) lands in a
+# top-K hit. Reports recall@k / MRR / misses — the "agents stop repeating
+# mistakes" measurement surface. Scope: the approved `memories` corpus (the
+# gateway's recall_memory surface); the vault_index lessons corpus is a separate
+# recall path (recall.py) — a future eval.
+
+@mcp.tool()
+def memory_eval_run(k: int = 5, rerank: bool = True, tag: str = None) -> dict:
+    """Run the memory-recall golden-set eval and report recall@k / MRR / misses.
+
+    For each enabled row in memory_eval_golden, runs its query through the
+    production hybrid pipeline (embed -> hybrid_recall over approved `memories`
+    -> optional 5060 rerank) and counts a hit when `expect` (case-insensitive)
+    appears in a top-K result's content/summary.
+
+    Args:
+        k: top-K depth to score (1..20, default 5).
+        rerank: apply the 5060 cross-encoder rerank (default True; degrades to RRF).
+        tag: optional — only eval golden rows carrying this tag.
+    """
+    require_authorized()
+    k = max(1, min(20, int(k)))
+    allowed_sens = [s for s, n in _SENS_ORDER.items() if n <= 2]  # up to 'sensitive'
+    pool = max(k, RECALL_HYBRID_POOL)
+
+    try:
+        with get_pg_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                if tag:
+                    cur.execute(
+                        "SELECT query, expect, tags FROM public.memory_eval_golden "
+                        "WHERE enabled AND %s = ANY(tags) ORDER BY created_at", (tag,))
+                else:
+                    cur.execute(
+                        "SELECT query, expect, tags FROM public.memory_eval_golden "
+                        "WHERE enabled ORDER BY created_at")
+                golden = [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        return {"error": f"golden-set load failed: {str(e)[:300]}"}
+    if not golden:
+        return {"error": "no enabled golden rows in memory_eval_golden", "n": 0}
+
+    results = []
+    embedder_degraded = False
+    for g in golden:
+        q, expect = g["query"], (g["expect"] or "")
+        emb = embed_query(q)
+        hits = []
+        if emb is None:
+            embedder_degraded = True
+            fb = _recall_fulltext(q, k, None, None, None, allowed_sens, False)
+            hits = (fb.get("memories") or [])[:k]
+        else:
+            try:
+                with get_pg_conn(readonly=True) as conn:
+                    cands = hybrid_recall(
+                        conn, q, emb, table="memories", limit=pool,
+                        filters={"sensitivity": allowed_sens, "status": "approved"},
+                        rrf_k=RECALL_RRF_K,
+                    )
+                if rerank and cands:
+                    ranked = _get_reranker().rerank(q, cands, text_key="content", top_k=k)
+                    hits = ranked if any(r.get("rerank_score") is not None for r in ranked) else cands[:k]
+                else:
+                    hits = cands[:k]
+            except Exception as e:
+                logger.warning("memory_eval_run: recall failed for %r: %s", q[:60], str(e)[:200])
+                hits = []
+        needle = expect.lower()
+        rank = None
+        for i, h in enumerate(hits[:k], start=1):
+            blob = ((h.get("content") or "") + " " + (h.get("summary") or "")).lower()
+            if needle and needle in blob:
+                rank = i
+                break
+        results.append({
+            "query": q, "expect": expect, "rank": rank, "hit": rank is not None,
+            "top_summary": (hits[0].get("summary") or (hits[0].get("content") or "")[:80]) if hits else None,
+        })
+
+    n = len(results)
+    hits_n = sum(1 for r in results if r["hit"])
+    mrr = round(sum(1.0 / r["rank"] for r in results if r["rank"]) / n, 4) if n else 0.0
+    return {
+        "k": k,
+        "n": n,
+        "hits": hits_n,
+        "recall_at_k": round(hits_n / n, 4) if n else 0.0,
+        "mrr": mrr,
+        "embedder_degraded": embedder_degraded,
+        "rerank_requested": bool(rerank),
+        "misses": [{"query": r["query"], "expect": r["expect"], "top_summary": r["top_summary"]}
+                   for r in results if not r["hit"]],
+        "corpus_note": "recall over approved `memories`; vault_index lessons corpus is a separate path (recall.py).",
+    }
+
+
+# ============================================================================
 # MCP Resources (Phase 1 of the control-plane plan) — read-only context.
 # ============================================================================
 # Resources expose read-only state agents would otherwise burn tool calls
