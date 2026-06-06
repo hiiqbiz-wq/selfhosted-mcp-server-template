@@ -1517,6 +1517,202 @@ def tts_generate(
         return {"error": str(e)[:500]}
 
 
+# ============================================================================
+# MCP Resources (Phase 1 of the control-plane plan) — read-only context.
+# ============================================================================
+# Resources expose read-only state agents would otherwise burn tool calls
+# rediscovering. Unlike tools, FastMCP resources must return a STRING (we
+# json.dumps every payload + set mime_type), and they run a sync function in a
+# threadpool. All are PACOM-backed: the gateway lives on the VPS and can reach
+# PACOM + Tailscale services, NOT the 5070 workspace filesystem — so anything
+# filesystem-bound (e.g. live tasks/projects) is served via the daily-crawled
+# vault_index, not by reading files. Each calls require_authorized() so the
+# ALLOWED_GH_USERS allowlist gates reads, not just transport-level OAuth.
+# Plan: plans/mcp-gateway-control-plane.md (Phase 1).
+
+def _utc_now_z() -> str:
+    return datetime.datetime.utcnow().isoformat() + "Z"
+
+
+@mcp.resource(
+    "hiiq://stack/health",
+    name="HIIQ Stack Health",
+    description="Read-only infra snapshot: PACOM reachability + version, OAuth client store, "
+                "query-embedder (5060) liveness, gateway identity. Collapses the per-service "
+                "health checks into one pull instead of many tool calls.",
+    mime_type="application/json",
+    tags={"hiiq", "ops", "health"},
+)
+def resource_stack_health() -> str:
+    require_authorized()
+    snap = {
+        "generated_at": _utc_now_z(),
+        "gateway": {
+            "server": "HIIQ Edge MCP gateway",
+            "version": "v5.5",
+            "node": "hiiqbiz-vps (Hostinger KVM 4, US-Boston)",
+            "auth_enabled": bool(GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET),
+        },
+        "pacom": {"reachable": False},
+        "oauth_client_store": {"rows": None},
+        "embedder": {"reachable": False, "endpoints": list(RECALL_EMBED_ENDPOINTS)},
+    }
+    try:
+        with get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT version()")
+                snap["pacom"]["version"] = cur.fetchone()[0].split(",")[0]
+                cur.execute("SELECT count(*) FROM pg_stat_user_tables")
+                snap["pacom"]["user_tables"] = cur.fetchone()[0]
+                cur.execute("SELECT count(*) FROM oauth_client_store")
+                snap["oauth_client_store"]["rows"] = cur.fetchone()[0]
+                snap["pacom"]["reachable"] = True
+    except Exception as e:
+        snap["pacom"]["error"] = str(e)[:200]
+    # Embedder liveness: cheap GET /api/tags (3s bound) so a sleeping 5060
+    # degrades fast instead of stalling the resource on a full embed timeout.
+    for url in RECALL_EMBED_ENDPOINTS:
+        base = url.rsplit("/api/", 1)[0]
+        try:
+            with httpx.Client(timeout=3.0) as client:
+                r = client.get(base + "/api/tags")
+            if r.status_code == 200:
+                snap["embedder"]["reachable"] = True
+                models = (r.json() or {}).get("models") or []
+                snap["embedder"]["models"] = [m.get("name") for m in models][:5]
+                break
+        except Exception as e:
+            snap["embedder"]["last_error"] = str(e)[:120]
+    snap["ok"] = bool(snap["pacom"]["reachable"])
+    return json.dumps(snap, indent=2, default=str)
+
+
+@mcp.resource(
+    "hiiq://memory/status",
+    name="HIIQ Memory Status",
+    description="Read-only memory-layer counts: public.memories (total / by status / embedded), "
+                "the cb_* corpus, vault_index (total / embedded / crawl freshness), and the "
+                "embed-on-write queue depth. Uses real count(*), not lagging stats.",
+    mime_type="application/json",
+    tags={"hiiq", "memory"},
+)
+def resource_memory_status() -> str:
+    require_authorized()
+    out = {"generated_at": _utc_now_z()}
+    try:
+        with get_pg_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT count(*) AS total, "
+                    "count(*) FILTER (WHERE status='approved') AS approved, "
+                    "count(*) FILTER (WHERE status='pending')  AS pending, "
+                    "count(*) FILTER (WHERE status='archived') AS archived, "
+                    "count(embedding) AS embedded "
+                    "FROM public.memories"
+                )
+                out["memories"] = dict(cur.fetchone())
+                cur.execute(
+                    "SELECT (SELECT count(*) FROM public.cb_knowledge_base)    AS cb_knowledge_base, "
+                    "       (SELECT count(*) FROM public.cb_semantic_memories) AS cb_semantic_memories"
+                )
+                out["cb_corpus"] = dict(cur.fetchone())
+                cur.execute(
+                    "SELECT count(*) AS total, count(embedding_1024) AS embedded, "
+                    "max(mtime) AS newest_file, max(indexed_at) AS last_indexed "
+                    "FROM public.vault_index"
+                )
+                out["vault_index"] = dict(cur.fetchone())
+                cur.execute("SELECT count(*) AS pending FROM public.memory_write_queue")
+                out["memory_write_queue"] = dict(cur.fetchone())
+        out["ok"] = True
+    except Exception as e:
+        out["ok"] = False
+        out["error"] = str(e)[:300]
+    return json.dumps(out, indent=2, default=str)
+
+
+@mcp.resource(
+    "hiiq://schemas/pacom",
+    name="PACOM Schema",
+    description="Read-only DDL snapshot of the PACOM database: every user table and its columns "
+                "(name + type) from information_schema. Lets an agent ground a query before "
+                "writing SQL instead of probing pacom_tables + guessing columns.",
+    mime_type="application/json",
+    tags={"hiiq", "pacom", "schema"},
+)
+def resource_schemas_pacom() -> str:
+    require_authorized()
+    out = {"generated_at": _utc_now_z(), "database": PACOM_PG_DBNAME}
+    try:
+        with get_pg_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT table_schema, table_name, column_name, data_type "
+                    "FROM information_schema.columns "
+                    "WHERE table_schema NOT IN ('pg_catalog','information_schema') "
+                    "ORDER BY table_schema, table_name, ordinal_position"
+                )
+                tables = {}
+                for r in cur.fetchall():
+                    key = f"{r['table_schema']}.{r['table_name']}"
+                    tables.setdefault(key, []).append({"column": r["column_name"], "type": r["data_type"]})
+        out["tables"] = tables
+        out["table_count"] = len(tables)
+        out["ok"] = True
+    except Exception as e:
+        out["ok"] = False
+        out["error"] = str(e)[:300]
+    return json.dumps(out, indent=2, default=str)
+
+
+@mcp.resource(
+    "hiiq://tasks/open",
+    name="HIIQ Open Tasks",
+    description="Read-only snapshot of the workspace task board (tasks/TASKS.md) as crawled into "
+                "PACOM vault_index by the daily 3:30 AM refresh. Returns the raw markdown plus the "
+                "file mtime + indexed_at so the consumer can judge staleness (up to ~24h).",
+    mime_type="application/json",
+    tags={"hiiq", "tasks"},
+)
+def resource_tasks_open() -> str:
+    require_authorized()
+    out = {
+        "generated_at": _utc_now_z(),
+        "source": "PACOM vault_index (workspace tasks/TASKS.md; daily crawl, up to ~24h stale)",
+    }
+    try:
+        with get_pg_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT path, content_text, mtime, indexed_at "
+                    "FROM public.vault_index "
+                    "WHERE scope = 'tasks' AND path ILIKE %s "
+                    "ORDER BY length(content_text) DESC LIMIT 1",
+                    ("%tasks%TASKS.md",),
+                )
+                row = cur.fetchone()
+        if not row:
+            out["ok"] = False
+            out["note"] = "tasks/TASKS.md not found in vault_index (scope='tasks') — crawl may be stale."
+        else:
+            out["ok"] = True
+            out["path"] = row["path"]
+            out["file_mtime"] = row["mtime"]
+            out["indexed_at"] = row["indexed_at"]
+            out["content"] = row["content_text"]
+    except Exception as e:
+        out["ok"] = False
+        out["error"] = str(e)[:300]
+    return json.dumps(out, indent=2, default=str)
+
+
+# NOTE: hiiq://projects/active is intentionally NOT shipped in Phase 1 — there is
+# no clean machine-readable PACOM source (the canonical active-project list is
+# CLAUDE.md hot-cache prose, fragile to parse, and vault_index's 'projects' scope
+# mixes active builds with archived/submodule dirs). Deferred to a later phase
+# behind a real projects registry rather than shipping a misleading list.
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
     mcp.run(transport="streamable-http", host="0.0.0.0", port=port, path="/mcp")
