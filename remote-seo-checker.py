@@ -4,7 +4,7 @@ HIIQ Edge MCP gateway v5.5 — upgrades recall_memory to HYBRID retrieval
 top-K turn-start-first) on top of v5.4 Chatterbox TTS + v5.3 docling.
 
 Runs on the Hostinger VPS (mcp.hiiqbiz.com). Reaches Pacific PACOM at
-100.87.218.106:5430, the hiiq-andre TTS service at 100.90.91.72:8019, and the
+100.87.218.106:5430, the HIIQ Local TTS service at 100.90.91.72:8770, and the
 hiiq-andre qwen3 embedder/reranker (Ollama :11434) — all via the host's
 Tailscale interface. Reaches the sibling docling-serve container via the
 internal Coolify docker network.
@@ -21,7 +21,7 @@ v5.5 — Hybrid recall (Phase 4 of the persistent-memory plan):
 Auth: GitHub OAuth via FastMCP's GitHubProvider (DCR-compliant, Claude.ai-friendly).
 Per-tool gate: require_authorized() checks login against ALLOWED_GH_USERS.
 
-Tools (21 total):
+Tools:
   Existing (Phase 4.1.x):
     ping_hiiq, pacom_tables, pacom_recent_cli, query_pacom,
     search_vault, pacom_skills, pacom_plugins, session_resume
@@ -38,14 +38,12 @@ Tools (21 total):
                           has zero auth and is reachable only on the private docker
                           network; this gateway is the public OAuth-gated surface.
 
-  New (v5.4 — Chatterbox TTS proxy):
-    tts_health          — probe hiiq-andre TTS service /health
-    tts_list_voices     — list 10-sec reference clips on hiiq-andre
-    tts_save_voice      — upload a new reference clip (base64 WAV)
-    tts_delete_voice    — remove a reference clip
-    tts_generate        — text → base64-encoded WAV via Chatterbox Turbo /
-                          Multilingual / Regular on RTX 5060. Reached over
-                          Tailscale; gateway forwards bearer token for auth.
+  v5.6 — HIIQ Local TTS proxy (repointed from retired Chatterbox :8019):
+    tts_health          — probe HIIQ Local TTS /healthz on :8770
+    tts_list_voices     — list the voice catalog (edge / f5 / elevenlabs)
+    tts_generate        — text -> base64 audio (MP3 for edge/elevenlabs, WAV
+                          for f5) via POST /synthesize on RTX 5060, over
+                          Tailscale. Engine is chosen by the voice.
 """
 
 import os
@@ -85,13 +83,14 @@ PACOM_PG_PASSWORD = os.environ.get("PACOM_PG_PASSWORD", "")
 DOCLING_SERVICE_URL = os.environ.get("DOCLING_SERVICE_URL", "http://docling-serve:5001").rstrip("/")
 DOCLING_HTTP_TIMEOUT = float(os.environ.get("DOCLING_HTTP_TIMEOUT", "180"))
 
-# --- TTS service on hiiq-andre via Tailscale (v5.4) ---
-# Chatterbox TTS (Resemble AI, MIT) runs on hiiq-andre's RTX 5060. Reached
-# via Tailscale (hiiqbiz-vps has Tailscale; same path used for PACOM at
-# 100.87.218.106). Unlike docling-serve, the TTS service requires bearer
-# auth — the gateway forwards CB_MCP_AUTH_TOKEN (HIIQ MCP discipline) so
-# the local service can verify the request came from an authorized client.
-TTS_SERVICE_URL = os.environ.get("TTS_SERVICE_URL", "http://100.90.91.72:8019").rstrip("/")
+# --- TTS service on HIIQ-RTX-5060 via Tailscale (v5.6) ---
+# HIIQ Local TTS (F5-TTS + Edge TTS + ElevenLabs) runs on the RTX 5060 as the
+# NSSM Windows service `hiiq-f5-tts`, bound 0.0.0.0:8770. Reached via Tailscale
+# (hiiqbiz-vps has Tailscale; same path used for PACOM at 100.87.218.106). This
+# replaced the retired Chatterbox service at :8019 (down since 2026-05-30). The
+# :8770 service is unauthenticated server-to-server (CORS gates browsers only),
+# so the bearer token below is optional - forwarded if set, never required.
+TTS_SERVICE_URL = os.environ.get("TTS_SERVICE_URL", "http://100.90.91.72:8770").rstrip("/")
 TTS_HTTP_TIMEOUT = float(os.environ.get("TTS_HTTP_TIMEOUT", "120"))
 TTS_SERVICE_TOKEN = (
     os.environ.get("TTS_SERVICE_TOKEN")
@@ -400,7 +399,7 @@ def ping_hiiq() -> dict:
     out = {
         "status": "ok",
         "server": "HIIQ Edge MCP gateway",
-        "version": "v5.5 (hybrid recall + docling + TTS proxy)",
+        "version": "v5.6 (hybrid recall + docling + TTS proxy -> :8770)",
         "node": "hiiqbiz-vps (Hostinger KVM 4, US-Boston)",
         "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
         "authenticated_as": user,
@@ -1277,50 +1276,50 @@ def convert_document(
 
 
 # ============================================================================
-# v5.4 — Chatterbox TTS proxy tools
+# v5.6 — HIIQ Local TTS proxy tools (repointed from retired Chatterbox :8019)
 # ============================================================================
-# Text-to-speech via hiiq-andre's RTX 5060. The TTS service is bearer-auth'd
-# (HIIQ MCP discipline — single master CB_MCP_AUTH_TOKEN) and reached over
-# Tailscale at TTS_SERVICE_URL. This gateway is the public OAuth-gated surface;
-# it forwards the bearer token automatically so callers don't need it.
+# Text-to-speech via the HIIQ Local TTS service on HIIQ-RTX-5060 (NSSM service
+# hiiq-f5-tts, bound :8770). Three engines selected per-voice: edge_tts (MS
+# neural, MP3, free/local), f5_tts (cloned voices, WAV), elevenlabs_tts (premium
+# MP3, paid API). The service is unauthenticated for server-to-server callers
+# (CORS gates browsers only), reached over Tailscale at TTS_SERVICE_URL; a
+# bearer token is forwarded if set but not required. This gateway is the public
+# OAuth-gated surface.
 #
-# Audio is base64-encoded WAV (PCM_16 24kHz mono) inline in the MCP response.
-# Suitable for clips up to ~30 seconds — longer scripts bloat the response.
-# For audiobook-length content, a URL-pointer return path would be needed
-# (deferred until first real use surfaces the constraint).
+# Audio is returned base64-encoded inline in the MCP response (MP3 for edge /
+# elevenlabs, WAV for f5). For audiobook-length content, chunk by paragraph.
 
 
 def _tts_auth_headers() -> dict:
-    """Build the bearer header for hiiq-andre's TTS service."""
+    """Bearer header for the HIIQ Local TTS service, if a token is configured.
+
+    The :8770 service is unauthenticated for server-to-server callers, so this
+    returns {} when no token is set (rather than failing). A token, if present,
+    is still forwarded - harmless, and future-proof if auth is added upstream.
+    """
     if not TTS_SERVICE_TOKEN:
-        raise RuntimeError(
-            "TTS_SERVICE_TOKEN / CB_MCP_AUTH_TOKEN not set on gateway. "
-            "The TTS service rejects unauthenticated requests."
-        )
+        return {}
     return {"Authorization": f"Bearer {TTS_SERVICE_TOKEN}"}
 
 
 @mcp.tool()
 def tts_health() -> dict:
-    """Health probe for the hiiq-andre Chatterbox TTS service.
+    """Health probe for the HIIQ Local TTS service (F5-TTS + Edge + ElevenLabs).
 
-    Confirms the TTS backend is reachable over Tailscale + CUDA is alive.
-    No generation round-trip — just a /health ping. Use this first if
+    Confirms the :8770 backend on HIIQ-RTX-5060 is reachable over Tailscale.
+    No generation round-trip - just a /healthz ping. Use this first if
     tts_generate() is failing to localize the problem (gateway-side env
-    misconfig vs Tailscale routing vs TTS service down vs CUDA issue).
+    misconfig vs Tailscale routing vs TTS service down).
 
     Returns:
         dict with `ok`, `status_code`, `tts_service_url`, and the upstream
-        health body (active_engine, cuda_device, vram_total_gb, voices_count).
-        On failure: `ok=False` plus `error` and a `hint`.
+        health body (status, engines, port). On failure: `ok=False` plus
+        `error` and a `hint`.
     """
     require_authorized()
     try:
-        # /health is no-auth on the TTS service, but send the header anyway
-        # so the gateway can fail-fast if the token isn't configured.
-        _tts_auth_headers()
         with httpx.Client(timeout=10.0) as client:
-            r = client.get(f"{TTS_SERVICE_URL}/health")
+            r = client.get(f"{TTS_SERVICE_URL}/healthz", headers=_tts_auth_headers())
         body = r.json() if r.headers.get("content-type", "").startswith("application/json") else r.text
         return {
             "ok": r.status_code == 200,
@@ -1334,25 +1333,26 @@ def tts_health() -> dict:
             "error": str(e)[:300],
             "tts_service_url": TTS_SERVICE_URL,
             "hint": (
-                "TTS service may not be running on hiiq-andre (start with "
-                "'execution/Running Scripts/_start_tts_service.ps1'), or "
-                "Tailscale on hiiqbiz-vps cannot reach 100.90.91.72:8019, "
-                "or TTS_SERVICE_URL env on the gateway is wrong."
+                "HIIQ Local TTS may be down on HIIQ-RTX-5060 (restart the NSSM "
+                "service: 'Restart-Service hiiq-f5-tts' elevated), or Tailscale on "
+                "hiiqbiz-vps cannot reach 100.90.91.72:8770, or TTS_SERVICE_URL env "
+                "on the gateway is wrong."
             ),
         }
 
 
 @mcp.tool()
 def tts_list_voices() -> dict:
-    """List the voice reference clips registered on hiiq-andre.
+    """List the voices registered on the HIIQ Local TTS service (:8770).
 
-    Each voice is a 10-second WAV at C:/HIIQ-Models/chatterbox/voices/<label>.wav.
-    Pass the `label` (filename minus .wav) as `voice=` to tts_generate() to
-    clone that speaker. Omitting `voice=` uses Chatterbox's baked-in default.
+    Each voice maps to a folder + voice.json on HIIQ-RTX-5060 and is served by
+    one of three engines: edge_tts (Microsoft neural, MP3, instant, free),
+    f5_tts (cloned voices, WAV), or elevenlabs_tts (premium MP3, paid API).
+    Pass a voice `name` as `voice=` to tts_generate().
 
     Returns:
-        dict with `voices`: list of {label, file, size_bytes, added_at}.
-        On failure: dict with `error` (e.g. service unreachable, auth failure).
+        dict with `voices`: list of {name, engine, status, config}.
+        On failure: dict with `error` (e.g. service unreachable).
     """
     require_authorized()
     try:
@@ -1365,129 +1365,43 @@ def tts_list_voices() -> dict:
         return {"error": str(e)[:300]}
 
 
-@mcp.tool()
-def tts_save_voice(label: str, audio_b64: str, overwrite: bool = False) -> dict:
-    """Register a new voice reference clip on hiiq-andre.
-
-    Args:
-        label: Lowercase identifier, a-z 0-9 _ -, max 31 chars (e.g. "andre",
-               "narrator-warm"). This becomes what `voice=` accepts.
-        audio_b64: Base64-encoded WAV. Should be ~10 seconds of clean continuous
-                   speech, single speaker, normal pace. Stereo → auto-mixed.
-        overwrite: Pass True to replace an existing label. Default False (409 on
-                   conflict).
-
-    Returns:
-        dict with `label`, `file`, `sample_rate`, `duration_s` on success.
-        On failure: dict with `error`.
-    """
-    require_authorized()
-    payload = {"label": label, "audio_b64": audio_b64, "overwrite": overwrite}
-    try:
-        with httpx.Client(timeout=30.0) as client:
-            r = client.post(
-                f"{TTS_SERVICE_URL}/voices",
-                headers=_tts_auth_headers(),
-                json=payload,
-            )
-        if r.status_code != 200:
-            return {"error": f"TTS service returned HTTP {r.status_code}", "body_excerpt": r.text[:500]}
-        return r.json()
-    except Exception as e:
-        return {"error": str(e)[:300]}
+# NOTE: voice management (add/remove) on the HIIQ Local TTS service is done
+# on-rig - each voice is a folder + voice.json under the 5060's voices dir, not
+# an HTTP endpoint - so the Chatterbox-era tts_save_voice / tts_delete_voice
+# tools were removed when the gateway repointed to :8770 (v5.6). Enumerate the
+# catalog with tts_list_voices().
 
 
 @mcp.tool()
-def tts_delete_voice(label: str) -> dict:
-    """Remove a voice reference clip from hiiq-andre.
+def tts_generate(text: str, voice: str = "assistant-cortana") -> dict:
+    """Generate speech audio from text via the HIIQ Local TTS service (:8770).
+
+    The engine is chosen by the voice (see tts_list_voices): edge_tts and
+    elevenlabs_tts return MP3, f5_tts returns WAV. Audio comes back inline as
+    base64. Good for short clips; for audiobook-length content, chunk by
+    paragraph and concatenate client-side.
 
     Args:
-        label: The label whose .wav should be deleted.
+        text: What to read aloud.
+        voice: A voice `name` from tts_list_voices(). Defaults to
+               "assistant-cortana" (Edge en-US-AriaNeural - instant, free,
+               local). Edge voices need no clone step; ElevenLabs voices spend
+               paid API credits; f5_tts voices need a reference clip on-rig.
 
     Returns:
-        dict with `label`, `deleted` on success.
-        On failure: dict with `error` (e.g. label not found).
-    """
-    require_authorized()
-    try:
-        with httpx.Client(timeout=10.0) as client:
-            r = client.delete(
-                f"{TTS_SERVICE_URL}/voices/{label}",
-                headers=_tts_auth_headers(),
-            )
-        if r.status_code != 200:
-            return {"error": f"TTS service returned HTTP {r.status_code}", "body_excerpt": r.text[:300]}
-        return r.json()
-    except Exception as e:
-        return {"error": str(e)[:300]}
-
-
-@mcp.tool()
-def tts_generate(
-    text: str,
-    voice: str = None,
-    engine: str = "turbo",
-    exaggeration: float = 0.0,
-    cfg_weight: float = 0.0,
-    temperature: float = 0.8,
-    language_id: str = None,
-) -> dict:
-    """Generate speech audio from text via hiiq-andre's Chatterbox TTS.
-
-    The audio comes back inline as base64-encoded WAV (PCM_16 24kHz mono).
-    Suitable for clips up to ~30 seconds — longer scripts bloat the MCP
-    response and may hit transport limits. For audiobook-length content,
-    chunk by paragraph and concatenate client-side.
-
-    Args:
-        text: What to read aloud. Max 8000 chars. Inline paralinguistic tags
-              supported: `[laugh]`, `[chuckle]`, `[cough]`.
-        voice: Optional label from tts_list_voices(). If omitted, the model's
-               baked-in default voice is used. Pass any saved label (e.g.
-               "andre", "narrator-warm") to clone that speaker.
-        engine: "turbo" (default, fastest, 1-step gen, paralinguistic tags),
-                "regular" (emotion exaggeration with stronger defaults), or
-                "multilingual" (23 languages, requires language_id).
-        exaggeration: 0.0–1.0. Emotion intensity. Turbo defaults 0.0 (flat),
-                      Regular defaults 0.5. Higher = more expressive.
-        cfg_weight: 0.0–1.0. Classifier-free guidance strength.
-        temperature: 0.1–1.5. Sampling randomness. Default 0.8.
-        language_id: Required for engine="multilingual". One of: en, es, fr,
-                     de, it, pt, ru, ja, ko, zh, ar, hi, tr, pl, nl, sv, id,
-                     vi, th, he, fa, uk, el.
-
-    Returns:
-        On success: dict with `audio_b64`, `sample_rate` (24000), `duration_s`,
-        `generation_time_s`, `engine`, `voice`, `text_len`.
+        On success: dict with `audio_b64`, `media_type` ("audio/mpeg" or
+        "audio/wav"), `format` ("mp3"/"wav"), `bytes`, `voice`, `text_len`.
         On failure: dict with `error` and optionally `hint`.
-
-    Note: First call after the TTS service restarts pays a ~50s cold-start
-    cost (model load + CUDA kernel JIT). Subsequent calls are ~1.5–2× realtime
-    on RTX 5060. Switching engines (turbo → multilingual) evicts the prior
-    engine to free VRAM, so back-to-back engine switches are slow.
     """
     require_authorized()
+    import base64
     if not text or not text.strip():
         return {"error": "text cannot be empty"}
-    if engine == "multilingual" and not language_id:
-        return {"error": "language_id is required when engine='multilingual'"}
-    if engine not in ("turbo", "regular", "multilingual"):
-        return {"error": f"engine must be one of turbo / regular / multilingual (got {engine!r})"}
-    payload = {
-        "text": text,
-        "engine": engine,
-        "exaggeration": float(exaggeration),
-        "cfg_weight": float(cfg_weight),
-        "temperature": float(temperature),
-    }
-    if voice:
-        payload["voice"] = voice
-    if language_id:
-        payload["language_id"] = language_id
+    payload = {"text": text, "voice": voice}
     try:
         with httpx.Client(timeout=TTS_HTTP_TIMEOUT) as client:
             r = client.post(
-                f"{TTS_SERVICE_URL}/generate",
+                f"{TTS_SERVICE_URL}/synthesize",
                 headers=_tts_auth_headers(),
                 json=payload,
             )
@@ -1496,20 +1410,34 @@ def tts_generate(
                 "error": f"TTS service returned HTTP {r.status_code}",
                 "body_excerpt": r.text[:500],
                 "hint": (
-                    "404 usually means an unknown voice label; "
-                    "400 means a parameter problem (e.g. multilingual without language_id); "
-                    "401 means TTS_SERVICE_TOKEN on the gateway doesn't match the TTS service's CB_MCP_AUTH_TOKEN; "
-                    "5xx means the TTS service is unhealthy — try tts_health()."
+                    "404 means the voice name isn't configured (check tts_list_voices); "
+                    "409 means the voice's engine can't serve it (e.g. an f5_tts voice "
+                    "missing its reference clip); 502/503 means an ElevenLabs voice's "
+                    "upstream API is unavailable; other 5xx - try tts_health()."
                 ),
             }
-        return r.json()
+        media_type = r.headers.get("content-type", "application/octet-stream").split(";")[0].strip()
+        if "wav" in media_type:
+            fmt = "wav"
+        elif "mpeg" in media_type or "mp3" in media_type:
+            fmt = "mp3"
+        else:
+            fmt = media_type
+        return {
+            "audio_b64": base64.b64encode(r.content).decode("ascii"),
+            "media_type": media_type,
+            "format": fmt,
+            "bytes": len(r.content),
+            "voice": voice,
+            "text_len": len(text),
+        }
     except httpx.TimeoutException:
         return {
             "error": "TTS generation timed out",
             "timeout_seconds": TTS_HTTP_TIMEOUT,
             "hint": (
-                "First call after TTS service restart needs ~50s for model load + CUDA JIT. "
-                "Long texts (>30s of audio) may exceed the timeout — chunk shorter or raise "
+                "f5_tts (cloned-voice) generation is the slowest; Edge/ElevenLabs are "
+                "fast. Long texts may exceed the timeout - chunk shorter or raise "
                 "TTS_HTTP_TIMEOUT env on the gateway."
             ),
         }
@@ -1800,7 +1728,7 @@ def resource_stack_health() -> str:
         "generated_at": _utc_now_z(),
         "gateway": {
             "server": "HIIQ Edge MCP gateway",
-            "version": "v5.5",
+            "version": "v5.6",
             "node": "hiiqbiz-vps (Hostinger KVM 4, US-Boston)",
             "auth_enabled": bool(GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET),
         },
