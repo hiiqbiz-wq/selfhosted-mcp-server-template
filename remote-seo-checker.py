@@ -52,10 +52,11 @@ import os
 import re
 import math
 import datetime
-import json
 import logging
+from collections import Counter
 import httpx
 import psycopg2
+from typing import Optional
 from psycopg2.extras import RealDictCursor, Json
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.github import GitHubProvider
@@ -97,6 +98,7 @@ TTS_SERVICE_TOKEN = (
     os.environ.get("TTS_SERVICE_TOKEN")
     or os.environ.get("CB_MCP_AUTH_TOKEN", "")
 ).strip()
+TTS_VOICE_LABEL_REGEX = re.compile(r"^[a-z0-9][a-z0-9_-]{0,30}$")
 
 # --- Hybrid recall: query embedder on hiiq-andre via Tailscale (v5.5) ---
 # recall_memory embeds the query through the same local qwen3 embedder PACOM
@@ -148,42 +150,6 @@ HIIQ_RIG_ALLOWLIST = {
 }  # empty set = no allowlist enforcement; any regex-valid rig passes
 
 
-# --- OAuth state persistence (M, 2026-06-03) ---
-# On headless Linux, FastMCP's default OAuth signing key is ephemeral (random
-# per boot) and its DCR client store defaults to memory -> EVERY redeploy
-# invalidates the claude.ai connector ("user must reconnect"). Persist both:
-#   1. a STABLE jwt_signing_key from env (issued tokens survive restart), and
-#   2. a durable client_storage in PACOM (DCR registrations survive restart).
-# The gateway already hard-depends on PACOM, so this adds no new failure mode.
-# Both are best-effort: a storage-init failure degrades to ephemeral (today's
-# behavior) rather than crashing the boot.
-_JWT_SIGNING_KEY = os.environ.get("JWT_SIGNING_KEY", "").strip() or None
-_oauth_client_storage = None
-try:
-    from key_value.aio.stores.postgresql import PostgreSQLStore
-    _oauth_client_storage = PostgreSQLStore(
-        host=PACOM_PG_HOST,
-        port=PACOM_PG_PORT,
-        database=PACOM_PG_DBNAME,
-        user=PACOM_PG_USER,
-        password=PACOM_PG_PASSWORD,
-        table_name="oauth_client_store",
-        auto_create=True,
-    )
-    print("[boot] OAuth client_storage: PostgreSQLStore(oauth_client_store) on PACOM", flush=True)
-except Exception as e:
-    print(
-        f"[boot] WARNING: OAuth client_storage unavailable ({e!r}); using ephemeral store "
-        "(connector will need reconnect on each redeploy).",
-        flush=True,
-    )
-if not _JWT_SIGNING_KEY:
-    print(
-        "[boot] WARNING: JWT_SIGNING_KEY unset -- issued tokens won't survive restart. "
-        "Set it in the Coolify env.",
-        flush=True,
-    )
-
 if GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET:
     auth = GitHubProvider(
         client_id=GITHUB_CLIENT_ID,
@@ -191,8 +157,6 @@ if GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET:
         base_url=PUBLIC_BASE_URL,
         redirect_path="/auth/callback",
         required_scopes=["read:user"],
-        jwt_signing_key=_JWT_SIGNING_KEY,
-        client_storage=_oauth_client_storage,
         allowed_client_redirect_uris=[
             "https://claude.ai/api/mcp/auth_callback",
             "https://claude.com/api/mcp/auth_callback",
@@ -548,6 +512,291 @@ def session_resume(only_unconsumed: bool = True, limit: int = 5) -> dict:
             return {"handoffs": [dict(r) for r in cur.fetchall()]}
 
 
+def _quantile(values: list[float], q: float) -> float | None:
+    """Return the q-quantile of values (0..1) using nearest-rank on sorted data."""
+    if not values:
+        return None
+    q = max(0.0, min(1.0, float(q)))
+    xs = sorted(float(v) for v in values)
+    idx = int(round(q * (len(xs) - 1)))
+    return xs[idx]
+
+
+def _is_error_status(status) -> bool:
+    """Best-effort classification of cli_audit.status into success vs error."""
+    if status is None:
+        return False
+    s = str(status).strip().lower()
+    if not s:
+        return False
+    if s in {"ok", "success", "succeeded", "passed"}:
+        return False
+    if s.isdigit():
+        return not s.startswith("2")
+    if s.startswith("2"):
+        return False
+    # Default: treat anything non-empty and non-success-looking as an error-ish signal.
+    return True
+
+
+def _safe_ratio(n: int, d: int) -> float:
+    return float(n) / float(d) if d else 0.0
+
+
+def _fetch_cli_audit(
+    *,
+    since: datetime.datetime,
+    rig: str | None,
+    limit: int,
+) -> list[dict]:
+    limit = max(1, min(2000, int(limit)))
+    where = ["ts >= %(since)s"]
+    params: dict = {"since": since, "limit": limit}
+    if rig:
+        where.append("rig_hostname = %(rig)s")
+        params["rig"] = rig
+    sql = f"""
+    SELECT ts, rig_hostname, tool_name, args, backend, endpoint,
+           status, error_message, duration_ms
+    FROM cli_audit
+    WHERE {' AND '.join(where)}
+    ORDER BY ts DESC
+    LIMIT %(limit)s
+    """
+    with get_pg_conn(readonly=True) as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, params)
+            return [dict(r) for r in cur.fetchall()]
+
+
+def _fetch_session_handoffs(
+    *,
+    since: datetime.datetime,
+    rig: str | None,
+    limit: int,
+) -> list[dict]:
+    limit = max(1, min(500, int(limit)))
+    where = ["ended_at >= %(since)s"]
+    params: dict = {"since": since, "limit": limit}
+    if rig:
+        where.append("rig_hostname = %(rig)s")
+        params["rig"] = rig
+    sql = f"""
+    SELECT session_id, rig_hostname, ended_at, last_command,
+           current_chapter, next_action, raw_handoff, consumed_at
+    FROM session_handoff
+    WHERE {' AND '.join(where)}
+    ORDER BY ended_at DESC NULLS LAST
+    LIMIT %(limit)s
+    """
+    with get_pg_conn(readonly=True) as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, params)
+            return [dict(r) for r in cur.fetchall()]
+
+
+@mcp.tool()
+def chronicle_tips(
+    days: int = 14,
+    max_cli_entries: int = 200,
+    max_handoffs: int = 50,
+    rig: str = None,
+    include_examples: bool = False,
+) -> dict:
+    """Analyze recent PACOM session history and recommend usage tips.
+
+    This is intended to back a client-side command like `/chronicle tips`.
+
+    Sources:
+      - cli_audit: recent CLI/tool activity (errors, durations, top tools)
+      - session_handoff: recent session handoffs (next_action hygiene, backlog)
+
+    Args:
+        days: Lookback window in days (1..90). Default 14.
+        max_cli_entries: Max cli_audit rows to analyze (1..2000). Default 200.
+        max_handoffs: Max session_handoff rows to analyze (1..500). Default 50.
+        rig: Optional override for rig hostname filter. If omitted, uses the
+             validated `x-hiiq-rig` header from the request when available.
+        include_examples: If True, include small samples of recent rows to help
+             interpret the tips.
+    """
+    user = require_authorized()
+    surface, _ua, detected_rig = detect_caller_surface()
+    rig_filter = (rig or "").strip().lower() or detected_rig
+    days = max(1, min(90, int(days)))
+    since = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc) - datetime.timedelta(days=days)
+
+    try:
+        cli_rows = _fetch_cli_audit(since=since, rig=rig_filter, limit=max_cli_entries)
+        handoffs = _fetch_session_handoffs(since=since, rig=rig_filter, limit=max_handoffs)
+    except Exception as e:
+        return {
+            "error": f"Unable to query PACOM session history: {str(e)[:300]}",
+            "caller": {"authenticated_as": user, "surface": surface, "rig": rig_filter},
+            "hint": (
+                "Check PACOM connectivity (ping_hiiq) and PACOM_* env vars on the gateway. "
+                "If you're expecting per-rig filtering, ensure your client sets the "
+                f"'{RIG_HEADER_NAME}' header (e.g. 'pacific', 'central')."
+            ),
+        }
+
+    tool_counts = Counter((r.get("tool_name") or "unknown") for r in cli_rows)
+    total_cli = len(cli_rows)
+    error_cli = sum(1 for r in cli_rows if _is_error_status(r.get("status")))
+    durations = [
+        float(r["duration_ms"])
+        for r in cli_rows
+        if r.get("duration_ms") is not None and str(r.get("duration_ms")).strip() != ""
+    ]
+    p50_ms = _quantile(durations, 0.50)
+    p90_ms = _quantile(durations, 0.90)
+
+    unconsumed = [h for h in handoffs if h.get("consumed_at") is None]
+    missing_next_action = [h for h in handoffs if not (h.get("next_action") or "").strip()]
+    missing_chapter = [h for h in handoffs if not (h.get("current_chapter") or "").strip()]
+
+    # Lightweight keyword scan over last_command for "what are you actually doing?"
+    cmd_hits = Counter()
+    for h in handoffs:
+        cmd = (h.get("last_command") or "").lower()
+        for key in ("recall_memory", "add_memory", "query_pacom", "search_vault", "convert_document", "tts_generate"):
+            if key in cmd:
+                cmd_hits[key] += 1
+
+    tips: list[str] = []
+
+    if rig_filter is None:
+        tips.append(
+            f"Set the '{RIG_HEADER_NAME}' header in your MCP client so tips can be scoped per rig."
+        )
+    if total_cli == 0 and not handoffs:
+        tips.append(
+            "No recent history found in PACOM for this window. If you expected data, confirm the "
+            "save-pacom/session logging pipeline is writing to cli_audit and session_handoff."
+        )
+
+    if total_cli:
+        err_rate = _safe_ratio(error_cli, total_cli)
+        if err_rate >= 0.25:
+            tips.append(
+                f"High error rate in recent activity ({error_cli}/{total_cli}). Start with ping_hiiq, "
+                "then inspect the most common failing command/tool to remove repeated friction."
+            )
+        elif err_rate >= 0.10:
+            tips.append(
+                f"Moderate error rate ({error_cli}/{total_cli}). Skim the latest failures first and "
+                "fix the top 1–2 root causes to reduce context switches."
+            )
+
+        if tool_counts:
+            top_tool, top_n = tool_counts.most_common(1)[0]
+            if _safe_ratio(top_n, total_cli) >= 0.60 and top_tool != "unknown":
+                tips.append(
+                    f"You're heavily relying on '{top_tool}' (~{int(100*_safe_ratio(top_n, total_cli))}% of entries). "
+                    "Consider batching or adding a higher-level helper so you run it fewer times per session."
+                )
+
+        if p90_ms is not None and p90_ms >= 10000:
+            tips.append(
+                f"Your slower operations are very slow (p90 ~{int(p90_ms)}ms). If these are expected (e.g. "
+                "document conversion), increase client timeouts or split work into smaller chunks."
+            )
+        elif p90_ms is not None and p90_ms >= 3000:
+            tips.append(
+                f"Some operations are noticeably slow (p90 ~{int(p90_ms)}ms). Prefer narrower queries/limits and "
+                "avoid repeating expensive calls with small parameter changes."
+            )
+
+    if handoffs:
+        if unconsumed:
+            tips.append(
+                f"You have {len(unconsumed)} unconsumed session handoff(s). Use session_resume() regularly to "
+                "pull forward the latest next_action and avoid duplicated work."
+            )
+        if missing_next_action and _safe_ratio(len(missing_next_action), len(handoffs)) >= 0.30:
+            tips.append(
+                "Many handoffs lack a clear next_action. Ending sessions with a single concrete next step "
+                "(command + expected outcome) makes resuming faster."
+            )
+        if missing_chapter and _safe_ratio(len(missing_chapter), len(handoffs)) >= 0.30:
+            tips.append(
+                "Many handoffs lack a current_chapter. Adding a short chapter label (e.g. 'Refactor', "
+                "'Debug', 'Ship') helps you rehydrate context quickly."
+            )
+
+    if cmd_hits.get("recall_memory", 0) >= 5 and cmd_hits.get("add_memory", 0) <= 1:
+        tips.append(
+            "You're recalling memories often but not saving new ones. When you discover a stable rule or "
+            "decision, add_memory(summary=..., content=...) to reduce repeat reasoning later."
+        )
+
+    if not tips:
+        tips.append(
+            "Your recent sessions look consistent. Keep doing quick handoffs, and prefer one clear next_action "
+            "to make resumes deterministic."
+        )
+
+    out = {
+        "caller": {"authenticated_as": user, "surface": surface, "rig": rig_filter},
+        "window": {"days": days, "since_utc": since.isoformat()},
+        "sources": {
+            "cli_audit": {"count": total_cli, "filtered_by_rig": rig_filter},
+            "session_handoff": {"count": len(handoffs), "unconsumed": len(unconsumed), "filtered_by_rig": rig_filter},
+        },
+        "summary": {
+            "top_cli_tools": tool_counts.most_common(10),
+            "cli_error_rate": round(_safe_ratio(error_cli, total_cli), 4) if total_cli else 0.0,
+            "duration_ms_p50": int(p50_ms) if p50_ms is not None else None,
+            "duration_ms_p90": int(p90_ms) if p90_ms is not None else None,
+            "handoff_missing_next_action": len(missing_next_action),
+            "handoff_missing_current_chapter": len(missing_chapter),
+            "handoff_command_hints": cmd_hits.most_common(10),
+        },
+        "tips": tips,
+    }
+
+    if include_examples:
+        out["examples"] = {
+            "cli_audit": cli_rows[:10],
+            "session_handoff": handoffs[:5],
+        }
+
+    return out
+
+
+@mcp.tool()
+def chronicle(
+    command: str = "tips",
+    days: int = 14,
+    max_cli_entries: int = 200,
+    max_handoffs: int = 50,
+    rig: str = None,
+    include_examples: bool = False,
+) -> dict:
+    """Multi-action chronicle entrypoint (client-friendly).
+
+    Intended for chat UIs that express tools as slash commands like:
+      `/chronicle tips`
+
+    Currently supported commands:
+      - tips: analyze recent activity and return recommendations
+    """
+    cmd = (command or "").strip().lower()
+    if cmd in {"tips", "tip"}:
+        return chronicle_tips(
+            days=days,
+            max_cli_entries=max_cli_entries,
+            max_handoffs=max_handoffs,
+            rig=rig,
+            include_examples=include_examples,
+        )
+    return {
+        "error": f"Unknown chronicle command: {command!r}",
+        "available_commands": ["tips"],
+        "usage": "chronicle(command='tips', days=14, ...)",
+    }
+
+
 # ============================================================================
 # Phase 4.7 — Bilateral memory tools
 # ============================================================================
@@ -669,33 +918,24 @@ def add_memory(
             sensitivity, Json(metadata),
         )
     else:
-        # Embed-on-write (N, 2026-06-03): embed the content at insert time so the
-        # gateway's hybrid recall vector arm is populated for memories written via
-        # THIS path (not just the add-memory CLI). Best-effort: if the 5060 embedder
-        # is unreachable, embed_query() returns None -> store a NULL embedding and
-        # the periodic backfill_memories drain on the 5070 backstops it. Secret tier
-        # is intentionally NOT embedded (content is encrypted + excluded from
-        # recall_memory), so this lives only in the non-secret branch.
-        _vec = embed_query(content)
-        _emb_literal = ("[" + ",".join(repr(float(x)) for x in _vec) + "]") if _vec else None
         sql = """
         INSERT INTO memories (
             content, summary, memory_type, scope, author,
             source_type, tags, related_ids,
             confidence, decision_matrix_anchors, confidence_reasoning,
-            status, sensitivity, metadata, embedding
+            status, sensitivity, metadata
         ) VALUES (
             %s, %s, %s, %s, %s,
             'mcp-gateway', %s, %s::uuid[],
             %s, %s, %s,
-            'pending', %s, %s, %s::vector
+            'pending', %s, %s
         ) RETURNING id, ts, status
         """
         params = (
             content, summary, memory_type, scope, author,
             tags, related_ids,
             int(confidence), decision_matrix_anchors, confidence_reasoning,
-            sensitivity, Json(metadata), _emb_literal,
+            sensitivity, Json(metadata),
         )
     try:
         with get_pg_conn(readonly=False) as conn:
@@ -794,7 +1034,7 @@ def recall_memory(
     scope: str = None,
     author: str = None,
     sensitivity_max: str = "sensitive",
-    include_pending: bool = False,
+    include_pending: bool = True,
     rerank: bool = True,
 ) -> dict:
     """
@@ -817,8 +1057,7 @@ def recall_memory(
         author: Optional equality filter on author (e.g. 'claude-code-pacific').
         sensitivity_max: Highest tier to return — 'public' | 'private' | 'sensitive'.
                          'secret' is NEVER returned here — use recall_sensitive_memory.
-        include_pending: If False (default), return APPROVED (verified) rows only — the
-                         authoritative layer. Set True to also include pending (unverified) rows.
+        include_pending: If True (default), include pending rows. False = approved only.
         rerank: If True (default), rerank the RRF candidate pool with the 5060
                 cross-encoder. Set False to skip the rerank hop (pure RRF order).
 
@@ -1300,6 +1539,16 @@ def _tts_auth_headers() -> dict:
     return {"Authorization": f"Bearer {TTS_SERVICE_TOKEN}"}
 
 
+def _validate_tts_voice_label(label: str) -> Optional[str]:
+    if not label:
+        return "label cannot be empty"
+    if len(label) > 31:
+        return "label must be 31 chars or fewer (a-z 0-9 _ -)"
+    if not TTS_VOICE_LABEL_REGEX.fullmatch(label):
+        return "label must match ^[a-z0-9][a-z0-9_-]{0,30}$ (lowercase a-z 0-9 _ -)"
+    return None
+
+
 @mcp.tool()
 def tts_health() -> dict:
     """Health probe for the hiiq-andre Chatterbox TTS service.
@@ -1318,9 +1567,9 @@ def tts_health() -> dict:
     try:
         # /health is no-auth on the TTS service, but send the header anyway
         # so the gateway can fail-fast if the token isn't configured.
-        _tts_auth_headers()
+        headers = _tts_auth_headers()
         with httpx.Client(timeout=10.0) as client:
-            r = client.get(f"{TTS_SERVICE_URL}/health")
+            r = client.get(f"{TTS_SERVICE_URL}/health", headers=headers)
         body = r.json() if r.headers.get("content-type", "").startswith("application/json") else r.text
         return {
             "ok": r.status_code == 200,
@@ -1382,6 +1631,10 @@ def tts_save_voice(label: str, audio_b64: str, overwrite: bool = False) -> dict:
         On failure: dict with `error`.
     """
     require_authorized()
+    label = (label or "").strip()
+    label_error = _validate_tts_voice_label(label)
+    if label_error:
+        return {"error": label_error}
     payload = {"label": label, "audio_b64": audio_b64, "overwrite": overwrite}
     try:
         with httpx.Client(timeout=30.0) as client:
@@ -1409,6 +1662,10 @@ def tts_delete_voice(label: str) -> dict:
         On failure: dict with `error` (e.g. label not found).
     """
     require_authorized()
+    label = (label or "").strip()
+    label_error = _validate_tts_voice_label(label)
+    if label_error:
+        return {"error": label_error}
     try:
         with httpx.Client(timeout=10.0) as client:
             r = client.delete(
@@ -1469,6 +1726,8 @@ def tts_generate(
     require_authorized()
     if not text or not text.strip():
         return {"error": "text cannot be empty"}
+    if len(text) > 8000:
+        return {"error": "text must be 8000 chars or fewer", "text_len": len(text)}
     if engine == "multilingual" and not language_id:
         return {"error": "language_id is required when engine='multilingual'"}
     if engine not in ("turbo", "regular", "multilingual"):
@@ -1515,483 +1774,6 @@ def tts_generate(
         }
     except Exception as e:
         return {"error": str(e)[:500]}
-
-
-# ============================================================================
-# Approval + audit spine (Phase 2 of the control-plane plan) — brakes before
-# the engine. dangerous_action_request() records a PENDING approval that ONLY
-# Andre can resolve; future mutating tools call require_approval(action) before
-# executing an irreversible action. PACOM table: public.approvals (migration 15).
-# ============================================================================
-
-class ApprovalRequired(Exception):
-    """Raised by require_approval() when no approved, unexpired approval exists
-    for an action. Future mutating tools catch this and return a structured
-    'approval required' result instead of performing the irreversible action."""
-
-
-def require_approval(action: str) -> dict:
-    """Gate for irreversible actions. Return the most recent approved + unexpired
-    approval row for `action`, or raise ApprovalRequired. The Phase-2 contract
-    every future mutating tool (email.send, infra.*, spend.*) plugs into."""
-    with get_pg_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                "SELECT id, action, status, resolved_by, resolved_at, expires_at "
-                "FROM public.approvals "
-                "WHERE action = %s AND status = 'approved' "
-                "  AND (expires_at IS NULL OR expires_at > now()) "
-                "ORDER BY resolved_at DESC NULLS LAST LIMIT 1",
-                (action,),
-            )
-            row = cur.fetchone()
-    if not row:
-        raise ApprovalRequired(
-            f"No approved approval for action '{action}'. Call "
-            f"dangerous_action_request('{action}', ...) and have Andre approval_resolve it."
-        )
-    return dict(row)
-
-
-@mcp.tool()
-def dangerous_action_request(action: str, payload: dict = None, reason: str = None, ttl_hours: int = 24) -> dict:
-    """Request approval for a dangerous / irreversible action. Records a PENDING
-    approval in PACOM that ONLY Andre can resolve (approval_resolve). Does NOT
-    execute the action — the requesting tool re-checks for an approved row first.
-
-    Args:
-        action: short dotted key for the action, e.g. 'email.send'.
-        payload: the proposed action's parameters (stored as JSON for the audit trail).
-        reason: why the action is wanted (shown to Andre).
-        ttl_hours: hours until an unresolved request expires (default 24, max 720).
-    """
-    user = require_authorized()
-    payload = payload or {}
-    ttl = max(1, min(720, int(ttl_hours)))
-    sql = """
-    INSERT INTO public.approvals (action, payload, reason, requested_by, expires_at)
-    VALUES (%s, %s::jsonb, %s, %s, now() + make_interval(hours => %s))
-    RETURNING id, status, requested_at, expires_at
-    """
-    try:
-        with get_pg_conn(readonly=False) as conn:
-            with conn.cursor() as cur:
-                cur.execute(sql, (action, json.dumps(payload), reason, user, ttl))
-                row = cur.fetchone()
-                conn.commit()
-        return {
-            "request_id": str(row[0]),
-            "status": row[1],
-            "action": action,
-            "requested_by": user,
-            "requested_at": row[2].isoformat() if row[2] else None,
-            "expires_at": row[3].isoformat() if row[3] else None,
-            "next": "Andre must approve via approval_resolve(request_id, 'approve') before the action runs.",
-        }
-    except Exception as e:
-        return {"error": str(e)[:500]}
-
-
-@mcp.tool()
-def approval_resolve(request_id: str, decision: str, note: str = None) -> dict:
-    """Andre-only: approve or deny a pending dangerous_action_request.
-
-    Args:
-        request_id: UUID returned by dangerous_action_request.
-        decision: 'approve' or 'deny'.
-        note: optional resolution note (kept in the audit trail).
-    """
-    user = require_andre()
-    d = (decision or "").strip().lower()
-    if d not in ("approve", "approved", "deny", "denied"):
-        return {"error": "decision must be 'approve' or 'deny'"}
-    new_status = "approved" if d.startswith("approve") else "denied"
-    sql = """
-    UPDATE public.approvals
-    SET status = %s, resolved_by = %s, resolved_at = now(), resolution_note = %s
-    WHERE id = %s AND status = 'pending'
-    RETURNING id, action, status, resolved_at
-    """
-    try:
-        with get_pg_conn(readonly=False) as conn:
-            with conn.cursor() as cur:
-                cur.execute(sql, (new_status, user, note, request_id))
-                row = cur.fetchone()
-                conn.commit()
-        if not row:
-            return {"error": f"No pending approval with id={request_id} (already resolved, expired, or unknown)."}
-        return {
-            "id": str(row[0]),
-            "action": row[1],
-            "status": row[2],
-            "resolved_by": user,
-            "resolved_at": row[3].isoformat() if row[3] else None,
-        }
-    except Exception as e:
-        return {"error": str(e)[:500]}
-
-
-@mcp.tool()
-def mcp_tool_audit() -> dict:
-    """Enumerate the gateway's registered tools + resources with their auth tier
-    (andre_only vs authorized). Read-only governance surface — shows the full
-    permission surface of everything the gateway exposes."""
-    require_authorized()
-    import asyncio
-    andre_only = {"verify_memory", "archive_memory", "approval_resolve"}
-
-    async def _collect():
-        tools, resources = [], []
-        get_t = getattr(mcp, "get_tools", None) or getattr(mcp, "list_tools", None)
-        get_r = getattr(mcp, "get_resources", None) or getattr(mcp, "list_resources", None)
-        if get_t:
-            t = await get_t()
-            tools = sorted(t.keys()) if isinstance(t, dict) else sorted(getattr(x, "name", str(x)) for x in t)
-        if get_r:
-            r = await get_r()
-            resources = sorted(r.keys()) if isinstance(r, dict) else sorted(str(getattr(x, "uri", x)) for x in r)
-        return tools, resources
-
-    try:
-        tools, resources = asyncio.run(_collect())
-    except Exception as e:
-        return {"error": str(e)[:300]}
-    return {
-        "tool_count": len(tools),
-        "resource_count": len(resources),
-        "andre_only_tools": [t for t in tools if t in andre_only],
-        "authorized_tools": [t for t in tools if t not in andre_only],
-        "resources": resources,
-    }
-
-
-# ============================================================================
-# Memory recall eval (Phase 3 of the control-plane plan) — measurable recall.
-# ============================================================================
-# memory_eval_run() scores the production recall pipeline against a golden set
-# (memory_eval_golden, migration 16): for each (query, expect) it runs the SAME
-# path recall_memory uses (embed -> hybrid_recall over approved `memories` ->
-# optional rerank) and checks whether `expect` (case-insensitive) lands in a
-# top-K hit. Reports recall@k / MRR / misses — the "agents stop repeating
-# mistakes" measurement surface. Scope: the approved `memories` corpus (the
-# gateway's recall_memory surface); the vault_index lessons corpus is a separate
-# recall path (recall.py) — a future eval.
-
-@mcp.tool()
-def memory_eval_run(k: int = 5, rerank: bool = True, tag: str = None) -> dict:
-    """Run the memory-recall golden-set eval and report recall@k / MRR / misses.
-
-    For each enabled row in memory_eval_golden, runs its query through the
-    production hybrid pipeline (embed -> hybrid_recall over approved `memories`
-    -> optional 5060 rerank) and counts a hit when `expect` (case-insensitive)
-    appears in a top-K result's content/summary.
-
-    Args:
-        k: top-K depth to score (1..20, default 5).
-        rerank: apply the 5060 cross-encoder rerank (default True; degrades to RRF).
-        tag: optional — only eval golden rows carrying this tag.
-    """
-    require_authorized()
-    k = max(1, min(20, int(k)))
-    allowed_sens = [s for s, n in _SENS_ORDER.items() if n <= 2]  # up to 'sensitive'
-    pool = max(k, RECALL_HYBRID_POOL)
-
-    try:
-        with get_pg_conn() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                if tag:
-                    cur.execute(
-                        "SELECT query, expect, tags FROM public.memory_eval_golden "
-                        "WHERE enabled AND %s = ANY(tags) ORDER BY created_at", (tag,))
-                else:
-                    cur.execute(
-                        "SELECT query, expect, tags FROM public.memory_eval_golden "
-                        "WHERE enabled ORDER BY created_at")
-                golden = [dict(r) for r in cur.fetchall()]
-    except Exception as e:
-        return {"error": f"golden-set load failed: {str(e)[:300]}"}
-    if not golden:
-        return {"error": "no enabled golden rows in memory_eval_golden", "n": 0}
-
-    results = []
-    embedder_degraded = False
-    for g in golden:
-        q, expect = g["query"], (g["expect"] or "")
-        emb = embed_query(q)
-        hits = []
-        if emb is None:
-            embedder_degraded = True
-            fb = _recall_fulltext(q, k, None, None, None, allowed_sens, False)
-            hits = (fb.get("memories") or [])[:k]
-        else:
-            try:
-                with get_pg_conn(readonly=True) as conn:
-                    cands = hybrid_recall(
-                        conn, q, emb, table="memories", limit=pool,
-                        filters={"sensitivity": allowed_sens, "status": "approved"},
-                        rrf_k=RECALL_RRF_K,
-                    )
-                if rerank and cands:
-                    ranked = _get_reranker().rerank(q, cands, text_key="content", top_k=k)
-                    hits = ranked if any(r.get("rerank_score") is not None for r in ranked) else cands[:k]
-                else:
-                    hits = cands[:k]
-            except Exception as e:
-                logger.warning("memory_eval_run: recall failed for %r: %s", q[:60], str(e)[:200])
-                hits = []
-        needle = expect.lower()
-        rank = None
-        for i, h in enumerate(hits[:k], start=1):
-            blob = ((h.get("content") or "") + " " + (h.get("summary") or "")).lower()
-            if needle and needle in blob:
-                rank = i
-                break
-        results.append({
-            "query": q, "expect": expect, "rank": rank, "hit": rank is not None,
-            "top_summary": (hits[0].get("summary") or (hits[0].get("content") or "")[:80]) if hits else None,
-        })
-
-    n = len(results)
-    hits_n = sum(1 for r in results if r["hit"])
-    mrr = round(sum(1.0 / r["rank"] for r in results if r["rank"]) / n, 4) if n else 0.0
-    return {
-        "k": k,
-        "n": n,
-        "hits": hits_n,
-        "recall_at_k": round(hits_n / n, 4) if n else 0.0,
-        "mrr": mrr,
-        "embedder_degraded": embedder_degraded,
-        "rerank_requested": bool(rerank),
-        "misses": [{"query": r["query"], "expect": r["expect"], "top_summary": r["top_summary"]}
-                   for r in results if not r["hit"]],
-        "corpus_note": "recall over approved `memories`; vault_index lessons corpus is a separate path (recall.py).",
-    }
-
-
-# ============================================================================
-# MCP Resources (Phase 1 of the control-plane plan) — read-only context.
-# ============================================================================
-# Resources expose read-only state agents would otherwise burn tool calls
-# rediscovering. Unlike tools, FastMCP resources must return a STRING (we
-# json.dumps every payload + set mime_type), and they run a sync function in a
-# threadpool. All are PACOM-backed: the gateway lives on the VPS and can reach
-# PACOM + Tailscale services, NOT the 5070 workspace filesystem — so anything
-# filesystem-bound (e.g. live tasks/projects) is served via the daily-crawled
-# vault_index, not by reading files. Each calls require_authorized() so the
-# ALLOWED_GH_USERS allowlist gates reads, not just transport-level OAuth.
-# Plan: plans/mcp-gateway-control-plane.md (Phase 1).
-
-def _utc_now_z() -> str:
-    return datetime.datetime.utcnow().isoformat() + "Z"
-
-
-@mcp.resource(
-    "hiiq://stack/health",
-    name="HIIQ Stack Health",
-    description="Read-only infra snapshot: PACOM reachability + version, OAuth client store, "
-                "query-embedder (5060) liveness, gateway identity. Collapses the per-service "
-                "health checks into one pull instead of many tool calls.",
-    mime_type="application/json",
-    tags={"hiiq", "ops", "health"},
-)
-def resource_stack_health() -> str:
-    require_authorized()
-    snap = {
-        "generated_at": _utc_now_z(),
-        "gateway": {
-            "server": "HIIQ Edge MCP gateway",
-            "version": "v5.5",
-            "node": "hiiqbiz-vps (Hostinger KVM 4, US-Boston)",
-            "auth_enabled": bool(GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET),
-        },
-        "pacom": {"reachable": False},
-        "oauth_client_store": {"rows": None},
-        "embedder": {"reachable": False, "endpoints": list(RECALL_EMBED_ENDPOINTS)},
-    }
-    try:
-        with get_pg_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT version()")
-                snap["pacom"]["version"] = cur.fetchone()[0].split(",")[0]
-                cur.execute("SELECT count(*) FROM pg_stat_user_tables")
-                snap["pacom"]["user_tables"] = cur.fetchone()[0]
-                cur.execute("SELECT count(*) FROM oauth_client_store")
-                snap["oauth_client_store"]["rows"] = cur.fetchone()[0]
-                snap["pacom"]["reachable"] = True
-    except Exception as e:
-        snap["pacom"]["error"] = str(e)[:200]
-    # Embedder liveness: cheap GET /api/tags (3s bound) so a sleeping 5060
-    # degrades fast instead of stalling the resource on a full embed timeout.
-    for url in RECALL_EMBED_ENDPOINTS:
-        base = url.rsplit("/api/", 1)[0]
-        try:
-            with httpx.Client(timeout=3.0) as client:
-                r = client.get(base + "/api/tags")
-            if r.status_code == 200:
-                snap["embedder"]["reachable"] = True
-                models = (r.json() or {}).get("models") or []
-                snap["embedder"]["models"] = [m.get("name") for m in models][:5]
-                break
-        except Exception as e:
-            snap["embedder"]["last_error"] = str(e)[:120]
-    snap["ok"] = bool(snap["pacom"]["reachable"])
-    return json.dumps(snap, indent=2, default=str)
-
-
-@mcp.resource(
-    "hiiq://memory/status",
-    name="HIIQ Memory Status",
-    description="Read-only memory-layer counts: public.memories (total / by status / embedded), "
-                "the cb_* corpus, vault_index (total / embedded / crawl freshness), and the "
-                "embed-on-write queue depth. Uses real count(*), not lagging stats.",
-    mime_type="application/json",
-    tags={"hiiq", "memory"},
-)
-def resource_memory_status() -> str:
-    require_authorized()
-    out = {"generated_at": _utc_now_z()}
-    try:
-        with get_pg_conn() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(
-                    "SELECT count(*) AS total, "
-                    "count(*) FILTER (WHERE status='approved') AS approved, "
-                    "count(*) FILTER (WHERE status='pending')  AS pending, "
-                    "count(*) FILTER (WHERE status='archived') AS archived, "
-                    "count(embedding) AS embedded "
-                    "FROM public.memories"
-                )
-                out["memories"] = dict(cur.fetchone())
-                cur.execute(
-                    "SELECT (SELECT count(*) FROM public.cb_knowledge_base)    AS cb_knowledge_base, "
-                    "       (SELECT count(*) FROM public.cb_semantic_memories) AS cb_semantic_memories"
-                )
-                out["cb_corpus"] = dict(cur.fetchone())
-                cur.execute(
-                    "SELECT count(*) AS total, count(embedding_1024) AS embedded, "
-                    "max(mtime) AS newest_file, max(indexed_at) AS last_indexed "
-                    "FROM public.vault_index"
-                )
-                out["vault_index"] = dict(cur.fetchone())
-                cur.execute("SELECT count(*) AS pending FROM public.memory_write_queue")
-                out["memory_write_queue"] = dict(cur.fetchone())
-        out["ok"] = True
-    except Exception as e:
-        out["ok"] = False
-        out["error"] = str(e)[:300]
-    return json.dumps(out, indent=2, default=str)
-
-
-@mcp.resource(
-    "hiiq://schemas/pacom",
-    name="PACOM Schema",
-    description="Read-only DDL snapshot of the PACOM database: every user table and its columns "
-                "(name + type) from information_schema. Lets an agent ground a query before "
-                "writing SQL instead of probing pacom_tables + guessing columns.",
-    mime_type="application/json",
-    tags={"hiiq", "pacom", "schema"},
-)
-def resource_schemas_pacom() -> str:
-    require_authorized()
-    out = {"generated_at": _utc_now_z(), "database": PACOM_PG_DBNAME}
-    try:
-        with get_pg_conn() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(
-                    "SELECT table_schema, table_name, column_name, data_type "
-                    "FROM information_schema.columns "
-                    "WHERE table_schema NOT IN ('pg_catalog','information_schema') "
-                    "ORDER BY table_schema, table_name, ordinal_position"
-                )
-                tables = {}
-                for r in cur.fetchall():
-                    key = f"{r['table_schema']}.{r['table_name']}"
-                    tables.setdefault(key, []).append({"column": r["column_name"], "type": r["data_type"]})
-        out["tables"] = tables
-        out["table_count"] = len(tables)
-        out["ok"] = True
-    except Exception as e:
-        out["ok"] = False
-        out["error"] = str(e)[:300]
-    return json.dumps(out, indent=2, default=str)
-
-
-@mcp.resource(
-    "hiiq://tasks/open",
-    name="HIIQ Open Tasks",
-    description="Read-only snapshot of the workspace task board (tasks/TASKS.md) as crawled into "
-                "PACOM vault_index by the daily 3:30 AM refresh. Returns the raw markdown plus the "
-                "file mtime + indexed_at so the consumer can judge staleness (up to ~24h).",
-    mime_type="application/json",
-    tags={"hiiq", "tasks"},
-)
-def resource_tasks_open() -> str:
-    require_authorized()
-    out = {
-        "generated_at": _utc_now_z(),
-        "source": "PACOM vault_index (workspace tasks/TASKS.md; daily crawl, up to ~24h stale)",
-    }
-    try:
-        with get_pg_conn() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(
-                    "SELECT path, content_text, mtime, indexed_at "
-                    "FROM public.vault_index "
-                    "WHERE scope = 'tasks' AND path ILIKE %s "
-                    "ORDER BY length(content_text) DESC LIMIT 1",
-                    ("%tasks%TASKS.md",),
-                )
-                row = cur.fetchone()
-        if not row:
-            out["ok"] = False
-            out["note"] = "tasks/TASKS.md not found in vault_index (scope='tasks') — crawl may be stale."
-        else:
-            out["ok"] = True
-            out["path"] = row["path"]
-            out["file_mtime"] = row["mtime"]
-            out["indexed_at"] = row["indexed_at"]
-            out["content"] = row["content_text"]
-    except Exception as e:
-        out["ok"] = False
-        out["error"] = str(e)[:300]
-    return json.dumps(out, indent=2, default=str)
-
-
-@mcp.resource(
-    "hiiq://governance/approvals",
-    name="HIIQ Approvals Log",
-    description="Read-only approval-spine state: status counts + the 50 most recent approval "
-                "requests/resolutions. The audit trail for dangerous_action_request / "
-                "approval_resolve (control-plane Phase 2).",
-    mime_type="application/json",
-    tags={"hiiq", "governance", "approvals"},
-)
-def resource_governance_approvals() -> str:
-    require_authorized()
-    out = {"generated_at": _utc_now_z()}
-    try:
-        with get_pg_conn() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT status, count(*) AS n FROM public.approvals GROUP BY status")
-                out["counts"] = {r["status"]: r["n"] for r in cur.fetchall()}
-                cur.execute(
-                    "SELECT id, action, status, reason, requested_by, requested_at, "
-                    "resolved_by, resolved_at, resolution_note, expires_at "
-                    "FROM public.approvals ORDER BY requested_at DESC LIMIT 50"
-                )
-                out["recent"] = [dict(r) for r in cur.fetchall()]
-        out["ok"] = True
-    except Exception as e:
-        out["ok"] = False
-        out["error"] = str(e)[:300]
-    return json.dumps(out, indent=2, default=str)
-
-
-# NOTE: hiiq://projects/active is intentionally NOT shipped in Phase 1 — there is
-# no clean machine-readable PACOM source (the canonical active-project list is
-# CLAUDE.md hot-cache prose, fragile to parse, and vault_index's 'projects' scope
-# mixes active builds with archived/submodule dirs). Deferred to a later phase
-# behind a real projects registry rather than shipping a misleading list.
 
 
 if __name__ == "__main__":
