@@ -1,0 +1,12 @@
+# Keep the prod image minimal. gate_import_check.py is intentionally NOT ignored —
+# the deploy gate runs it INSIDE the built image to resolve the entrypoint's imports.
+.git
+.gitignore
+__pycache__/
+*.pyc
+logs/
+deploy_gate.py
+hooks/
+Dockerfile.gatetest-bad
+*.log
+README.md
