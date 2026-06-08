@@ -11,16 +11,22 @@ Docker image is broken (e.g. a Dockerfile that COPYs modules by name and omits a
 See: .claude/memory/lessons/dockerfile-copy-by-name-omits-new-modules.md  (board task O).
 
 Stages:
-  1. docker build      -> catches Dockerfile / requirements install errors
-  2. in-image import   -> runs gate_import_check.py INSIDE the built image; a missing or
-                          broken module the entrypoint imports fails here (the real catch)
-  3. smoke (optional)  -> GET a URL, assert status (default 401 = the live gateway's "up")
+  0. source sentinels      -> assert deploy-keystone artifact content is present
+  1. docker build          -> catches Dockerfile / requirements install errors
+  2. in-image import       -> runs gate_import_check.py INSIDE the built image; a missing or
+                              broken module the entrypoint imports fails here (the real catch)
+  3. in-image capabilities -> imports the actual gateway entrypoint and enumerates FastMCP
+                              tools/resources so a valid-but-regressed tree cannot pass
+  4. session lifecycle     -> calls session_end + session_boot with fake PACOM
+                              and asserts write-through + citation-ready output
+  5. smoke (optional)      -> GET a URL, assert status (default 401 = the live gateway's "up")
 
 Pure stdlib + subprocess; needs `docker` on PATH. Run via `uv run python deploy_gate.py`.
 Exit 0 = PASS (safe to push); non-zero = FAIL (push blocked when wired as a pre-push hook).
 """
 import argparse
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -30,6 +36,21 @@ import urllib.request
 HERE = pathlib.Path(__file__).resolve().parent
 IMAGE = "hiiq-gateway-gate:local"
 CHECK = "gate_import_check.py"
+CAPABILITY_CHECK = "gate_capability_check.py"
+SESSION_LIFECYCLE_CHECK = "gate_session_boot_check.py"
+
+SOURCE_SENTINELS = (
+    (
+        "Dockerfile",
+        re.compile(r"(?m)^\s*COPY\s+\*\.py\s+\./\s*$"),
+        "Dockerfile must copy every Python sibling into the image (COPY *.py ./).",
+    ),
+    (
+        "requirements.txt",
+        re.compile(r"(?m)^\s*py-key-value-aio\[postgresql\]\s*$"),
+        "requirements.txt must keep the PACOM-backed OAuth client-store dependency.",
+    ),
+)
 
 
 def run(cmd, **kw):
@@ -50,6 +71,23 @@ def smoke(url, expect):
     return code == expect
 
 
+def source_sentinels_ok(context):
+    ok = True
+    root = pathlib.Path(context).resolve()
+    for rel, pattern, message in SOURCE_SENTINELS:
+        path = root / rel
+        try:
+            text = path.read_text(encoding="utf-8")
+        except Exception as e:
+            print(f"source sentinel: {rel} unreadable: {e!r}", file=sys.stderr)
+            ok = False
+            continue
+        if not pattern.search(text):
+            print(f"source sentinel: {rel} failed - {message}", file=sys.stderr)
+            ok = False
+    return ok
+
+
 def main():
     ap = argparse.ArgumentParser(description="HIIQ Edge gateway pre-push deploy gate")
     ap.add_argument("--context", default=str(HERE), help="docker build context (default: repo root)")
@@ -63,6 +101,10 @@ def main():
     if not shutil.which("docker"):
         print("GATE FAIL: docker not on PATH (is Docker Desktop running?)", file=sys.stderr)
         return 2
+
+    if not source_sentinels_ok(args.context):
+        print("\nGATE FAIL: deploy-keystone source content missing/regressed", file=sys.stderr)
+        return 1
 
     build = ["docker", "build", "-t", args.image]
     if args.dockerfile:
@@ -83,13 +125,35 @@ def main():
         _cleanup(args)
         return 1
 
+    cap = run(["docker", "run", "--rm", "--entrypoint", "python", args.image, f"/app/{CAPABILITY_CHECK}"],
+              capture_output=True, text=True)
+    sys.stdout.write(cap.stdout)
+    if cap.stderr:
+        sys.stderr.write(cap.stderr)
+    if cap.returncode != 0:
+        print("\nGATE FAIL: in-image capability check failed - the built gateway no longer "
+              "exposes the expected control-plane tools/resources/dependencies.", file=sys.stderr)
+        _cleanup(args)
+        return 1
+
+    lifecycle = run(["docker", "run", "--rm", "--entrypoint", "python", args.image, f"/app/{SESSION_LIFECYCLE_CHECK}"],
+                    capture_output=True, text=True)
+    sys.stdout.write(lifecycle.stdout)
+    if lifecycle.stderr:
+        sys.stderr.write(lifecycle.stderr)
+    if lifecycle.returncode != 0:
+        print("\nGATE FAIL: session lifecycle behavior check failed - the grounding path no longer "
+              "writes session_end handoffs and returns them through session_boot.", file=sys.stderr)
+        _cleanup(args)
+        return 1
+
     if args.smoke_url and not smoke(args.smoke_url, args.smoke_expect):
         print("\nGATE FAIL: smoke test", file=sys.stderr)
         _cleanup(args)
         return 1
 
     _cleanup(args)
-    print("\nGATE PASS  (image builds + all entrypoint imports resolve)")
+    print("\nGATE PASS  (image builds + imports resolve + control-plane surface + session lifecycle contract match baseline)")
     return 0
 
 

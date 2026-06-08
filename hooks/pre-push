@@ -1,12 +1,13 @@
 #!/bin/sh
 # HIIQ Edge gateway — pre-push deploy gate.
-# Blocks a push that would crash-loop in Coolify (Docker build + in-image import check).
+# Blocks a push that would crash-loop or silently regress the Coolify gateway
+# surface (Docker build + in-image import check + capability + session lifecycle contract).
 # Wired via:  git config core.hooksPath hooks   (see README / deploy_gate.py).
 # Escape hatch for a doc-only / non-deploy push:  git push --no-verify
 set -e
 
 ROOT="$(git rev-parse --show-toplevel)"
-echo "[pre-push] HIIQ gateway deploy gate: docker build + in-image import check..."
+echo "[pre-push] HIIQ gateway deploy gate: docker build + import check + capability + session lifecycle contract..."
 
 if command -v uv >/dev/null 2>&1; then
   uv run python "$ROOT/deploy_gate.py"
