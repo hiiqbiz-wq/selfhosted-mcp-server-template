@@ -69,6 +69,8 @@ from psycopg2.extras import RealDictCursor, Json
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.github import GitHubProvider
 from fastmcp.server.dependencies import get_access_token, get_http_request
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 # Phase 4 hybrid-retrieval modules (sibling files shipped with this gateway).
 # Both degrade gracefully: hybrid_recall raises only on programmer error
@@ -220,6 +222,16 @@ else:
         "[boot] WARNING: GITHUB_OAUTH_CLIENT_ID/SECRET not set — gateway is OPEN.",
         flush=True,
     )
+
+
+@mcp.custom_route("/healthz", methods=["GET"])
+async def healthz(request: Request) -> JSONResponse:
+    """Unauthenticated liveness probe — monitors hit this instead of the auth-gated /mcp.
+
+    Only reachable with Host: mcp.hiiqbiz.com (Traefik routes by Host; raw-IP
+    requests get Coolify's catchall 503 before reaching the app).
+    """
+    return JSONResponse({"status": "ok"})
 
 
 def require_authorized() -> str:
